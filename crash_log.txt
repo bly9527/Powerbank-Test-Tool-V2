@@ -1,0 +1,9 @@
+=== 软件异常退出崩溃日志 ===
+Python 解释器: C:\Users\30583\AppData\Local\Programs\Python\Python312\python.exe
+工作目录: C:\Users\30583\Desktop\充电宝数显均匀度自动测试工具
+Traceback (most recent call last):
+  File "C:\Users\30583\Desktop\充电宝数显均匀度自动测试工具\main.py", line 36, in <module>
+    from ui.main_window import MainWindow
+  File "C:\Users\30583\Desktop\充电宝数显均匀度自动测试工具\ui\main_window.py", line 40
+    template_name = 'PB519数显均匀度测试表(9.15修带标).xlsx'
+IndentationError: unexpected indent
