@@ -35,6 +35,7 @@ from ui.segment_dialog import SegmentDatasetDialog
 from core.project_archive import (ProjectArchive, create_project, delete_project,
     project_catalog, group_key)
 from core.resource_monitor import ResourceMonitor
+from core.performance import high_speed_threads
 
 
 class MainWindow(QMainWindow):
@@ -370,7 +371,6 @@ class MainWindow(QMainWindow):
         self.lbl_lcd_ignore.setWordWrap(True)
         grp_params_layout.addWidget(self.lbl_lcd_ignore, 7, 0, 1, 2)
         self.cb_digit_type.currentIndexChanged.connect(self.update_segment_controls)
-        self.update_segment_controls()
 
         left_layout.addWidget(grp_params)
 
@@ -378,6 +378,16 @@ class MainWindow(QMainWindow):
         resource_layout = QVBoxLayout(grp_resource)
         self.lbl_resource = QLabel('CPU / GPU：正在读取…')
         resource_layout.addWidget(self.lbl_resource)
+        self.cb_cpu_high_speed = QCheckBox('CPU 高速模式（预留部分算力）')
+        performance_settings = QSettings('PowerbankTestTool', 'Performance')
+        self.cb_cpu_high_speed.setChecked(performance_settings.value('high_speed', False, type=bool))
+        self.cb_cpu_high_speed.setToolTip(
+            '自动使用约85%的逻辑线程，加速数码管样本匹配和OCR。\n'
+            '实际CPU占用取决于视频读取和识别任务，不保证固定百分比。下次开始分析时生效。')
+        self.cb_cpu_high_speed.toggled.connect(self.on_high_speed_changed)
+        resource_layout.addWidget(self.cb_cpu_high_speed)
+        self.lbl_cpu_budget = QLabel(f'高速模式使用 {high_speed_threads()} / {os.cpu_count() or 1} 个逻辑线程')
+        resource_layout.addWidget(self.lbl_cpu_budget)
         cpu_row = QHBoxLayout()
         cpu_row.addWidget(QLabel('识别计算线程数:'))
         self.cb_cpu_threads = QComboBox()
@@ -397,6 +407,7 @@ class MainWindow(QMainWindow):
                 'cpu_threads', self.cb_cpu_threads.currentData() or ''))
         cpu_row.addWidget(self.cb_cpu_threads, 1)
         resource_layout.addLayout(cpu_row)
+        self.update_segment_controls()
         left_layout.addWidget(grp_resource)
 
         # --- 模块4: 运行与导出 ---
@@ -1186,6 +1197,8 @@ class MainWindow(QMainWindow):
 
     def update_segment_controls(self):
         running = bool(self.worker and self.worker.isRunning())
+        self.cb_cpu_high_speed.setEnabled(not running)
+        self.cb_cpu_threads.setEnabled(not running and not self.cb_cpu_high_speed.isChecked())
         lcd = self.cb_digit_type.currentData() != SEGMENT_MODE
         self.lbl_lcd_ignore.setVisible(lcd)
         for unit, button in self.lcd_ignore_buttons.items():
@@ -1199,6 +1212,10 @@ class MainWindow(QMainWindow):
             return
         names = {entry['path']: entry['name'] for entry in template_catalog(self.segment_paths[1] + self.segment_paths[2])}
         self.lbl_segment_templates.setText('\n'.join(f'{unit}# 模板：' + ('、'.join(names.get(p, p) for p in self.segment_paths[unit]) or '未选择') for unit in (1, 2)))
+
+    def on_high_speed_changed(self, checked):
+        QSettings('PowerbankTestTool', 'Performance').setValue('high_speed', checked)
+        self.cb_cpu_threads.setEnabled(not checked and not (self.worker and self.worker.isRunning()))
 
     def edit_lcd_ignore_regions(self, unit):
         if self.cb_digit_type.currentData() == SEGMENT_MODE or (self.worker and self.worker.isRunning()):
@@ -1335,6 +1352,8 @@ class MainWindow(QMainWindow):
 
     def start_analysis(self):
         try:
+            if self.worker and self.worker.isRunning():
+                return
             if self.dirty_units and QMessageBox.question(self, '结果尚未保存',
                     '当前表格有未存入存档的结果。开始新分析会清空它，继续吗？') != QMessageBox.Yes:
                 return
@@ -1396,7 +1415,8 @@ class MainWindow(QMainWindow):
                 digit_type=digit_type,
                 segment_paths=dict(self.segment_paths),
                 lcd_ignore_regions=dict(self.lcd_ignore_regions),
-                cpu_threads=self.cb_cpu_threads.currentData()
+                cpu_threads=self.cb_cpu_threads.currentData(),
+                high_speed=self.cb_cpu_high_speed.isChecked()
             )
             self.worker.progress_signal.connect(self.on_worker_progress)
             self.worker.point_detected_signal.connect(self.on_worker_point_detected)

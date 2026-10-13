@@ -450,7 +450,10 @@ def feature(image, ignore_regions=()):
 
 
 class SegmentMatcher:
-    def __init__(self, root, threshold=.88, margin=.015):
+    def __init__(self, root, threshold=.88, margin=.015, *, executor=None, workers=1):
+        # The analysis worker owns the executor; matching never starts nested pools.
+        self.executor = executor
+        self.workers = max(1, int(workers))
         self.roots = [Path(p) for p in library_paths(root)]
         self.root = self.roots[0] if self.roots else None
         self.threshold, self.margin = threshold, margin
@@ -483,15 +486,17 @@ class SegmentMatcher:
         prepared = {regions: (cv2.copyMakeBorder(c, 3, 3, 3, 3, cv2.BORDER_CONSTANT), float(c.sum()))
                     for regions, c in candidates.items() if c is not None}
         scores = {}
-        for (label, template), template_ink, regions in zip(self.templates, self.template_ink, self.template_regions):
-            if regions not in prepared:
-                continue
-            padded, candidate_ink = prepared[regions]
-            correlation = float(cv2.minMaxLoc(cv2.matchTemplate(padded, template, cv2.TM_CCOEFF_NORMED))[1])
-            # An icon-only blink may correlate with a digit. Penalize missing
-            # illuminated strokes, while tolerating brighter/thicker real digits.
-            score = correlation * min(1.0, candidate_ink / template_ink)
-            scores[label] = max(scores.get(label, -1), score)
+        if self.executor is not None and self.workers > 1 and len(self.templates) > 64:
+            size = max(64, (len(self.templates) + self.workers - 1) // self.workers)
+            futures = [self.executor.submit(self._score_templates, prepared, start,
+                       min(start+size, len(self.templates)))
+                       for start in range(0, len(self.templates), size)]
+            # Merge in original template order so ties keep the serial decision.
+            for future in futures:
+                for label, score in future.result().items():
+                    scores[label] = max(scores.get(label, -1), score)
+        else:
+            scores = self._score_templates(prepared, 0, len(self.templates))
         ranked = sorted(scores.items(), key=lambda pair: pair[1], reverse=True)
         label, score = ranked[0]
         runner_up = ranked[1][1] if len(ranked) > 1 else -1
@@ -505,6 +510,21 @@ class SegmentMatcher:
             self.last_reason = f'匹配 {label}%，相似度 {score:.3f}'
             return label, score
         return None, max(0.0, score)
+
+    def _score_templates(self, prepared, start, end):
+        scores = {}
+        for index in range(start, end):
+            label, template = self.templates[index]
+            template_ink, regions = self.template_ink[index], self.template_regions[index]
+            if regions not in prepared:
+                continue
+            padded, candidate_ink = prepared[regions]
+            correlation = float(cv2.minMaxLoc(cv2.matchTemplate(padded, template, cv2.TM_CCOEFF_NORMED))[1])
+            # An icon-only blink may correlate with a digit. Penalize missing
+            # illuminated strokes, while tolerating brighter/thicker real digits.
+            score = correlation * min(1.0, candidate_ink / template_ink)
+            scores[label] = max(scores.get(label, -1), score)
+        return scores
 
 
 class SampleCaptureWorker(QThread):

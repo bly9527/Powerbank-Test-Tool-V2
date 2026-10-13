@@ -8,6 +8,8 @@ from pathlib import Path
 from uuid import uuid4
 from core.record_evidence import save_evidence
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from core.performance import high_speed_threads
 from datetime import time
 from PyQt5.QtCore import QThread, pyqtSignal
 from core.ocr_engine import OCREngine
@@ -44,6 +46,7 @@ class VideoAnalysisWorker(QThread):
                  cap_unit='Ah', digit_type=0,
                  segment_paths=None,
                  cpu_threads=None,
+                 high_speed=False,
                  roi_soc=None, roi_time=None, roi_cap=None,
                  lcd_ignore_regions=None,
                  **kwargs):
@@ -84,6 +87,7 @@ class VideoAnalysisWorker(QThread):
         self.modes = modes or {1: mode, 2: mode}
         self.active_units = set(active_units or (1, 2))
         self.cpu_threads = cpu_threads
+        self.high_speed = bool(high_speed)
         self.sample_interval = max(0.2, float(sample_interval_sec))
         self.debounce_count = max(1, int(debounce_count))
         self.cap_unit = cap_unit  # 'Ah' 或 'mAh'
@@ -168,11 +172,18 @@ class VideoAnalysisWorker(QThread):
         return value, record
 
     def run(self):
+        pool = None
+        previous_cv_threads = cv2.getNumThreads()
         try:
-            if self.cpu_threads:
-                cv2.setNumThreads(self.cpu_threads)
+            threads = high_speed_threads() if self.high_speed else self.cpu_threads
+            if self.high_speed and self.digit_type == SEGMENT_MODE:
+                # Parallelize independent templates, not frames or tracker updates.
+                cv2.setNumThreads(1)
+                pool = ThreadPoolExecutor(max_workers=threads, thread_name_prefix='segment-match')
+            elif threads:
+                cv2.setNumThreads(threads)
             # 在工作线程内部初始化 OCR 引擎
-            self.ocr_engine = OCREngine(cpu_threads=self.cpu_threads) if self.cpu_threads else OCREngine()
+            self.ocr_engine = OCREngine(cpu_threads=threads) if threads else OCREngine()
 
             cap = cv2.VideoCapture(self.video_path)
             if not cap.isOpened():
@@ -202,7 +213,8 @@ class VideoAnalysisWorker(QThread):
                         path = self.segment_paths.get(unit)
                         if not path:
                             raise ValueError(f'{unit}# 尚未选择数码管样本库')
-                        matcher = SegmentMatcher(path)
+                        matcher = (SegmentMatcher(path, executor=pool, workers=threads)
+                                   if pool is not None else SegmentMatcher(path))
                         if not matcher.labels:
                             raise ValueError(f'{unit}# 样本库没有已确认的数字，请先采集并标注')
                         segment_matchers[unit] = matcher
@@ -419,3 +431,6 @@ class VideoAnalysisWorker(QThread):
         finally:
             if 'cap' in locals():
                 cap.release()
+            if pool is not None:
+                pool.shutdown(wait=True, cancel_futures=True)
+            cv2.setNumThreads(previous_cv_threads)
