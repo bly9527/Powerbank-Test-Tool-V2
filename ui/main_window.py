@@ -1,6 +1,7 @@
 # 必须在最顶部导入 onnxruntime，避免 Windows 下 C++ 运行时 DLL 冲突
 import onnxruntime
 import os
+import math
 import json
 import re
 import sys
@@ -1076,11 +1077,25 @@ class MainWindow(QMainWindow):
         except ValueError:
             return
 
+        if not math.isfinite(video_sec) or video_sec < 0:
+            return
         records = self.extracted_records_1 if unit_id == 1 else self.extracted_records_2
         soc = int(table.item(row, 0).text().replace('%', ''))
-        record = dict(records.get(soc, {'video_sec': video_sec}))
+        record = dict(records.get(soc) or {})
+        try:
+            saved_sec = float(record.get('video_sec'))
+        except (TypeError, ValueError, OverflowError):
+            saved_sec = float('nan')
+        if not math.isfinite(saved_sec) or saved_sec < 0 or isinstance(record.get('video_sec'), bool):
+            # Manual edits may create a record without locator metadata. Only
+            # the video-position column can supply it, never the test clock.
+            record['video_sec'] = video_sec
+        else:
+            record['video_sec'] = saved_sec
+        record.setdefault('soc', soc)
         record.setdefault('source_video', self.video_path)
         self._selected_record_preview = record
+        self._selected_record_unit = unit_id
         self.btn_locate_record.setEnabled(bool(record.get('source_video')))
         snapshot = load_snapshot(record)
         if snapshot is not None:
@@ -1421,6 +1436,7 @@ class MainWindow(QMainWindow):
             self.worker.progress_signal.connect(self.on_worker_progress)
             self.worker.point_detected_signal.connect(self.on_worker_point_detected)
             self.worker.review_pending_signal.connect(self.on_worker_review_pending)
+            self.worker.point_revoked_signal.connect(self.on_worker_point_revoked)
             self.worker.finished_signal.connect(self.on_worker_finished)
             self.worker.error_signal.connect(self.on_worker_error)
             self.worker.finished.connect(self.update_segment_controls)
@@ -1455,6 +1471,40 @@ class MainWindow(QMainWindow):
             f"1#:[电量 {soc1_str}, 容量 {cap1_str}] | "
             f"2#:[电量 {soc2_str}, 容量 {cap2_str}]"
         )
+
+    def on_worker_point_revoked(self, unit_id, record):
+        if self._closing:
+            return
+        records = self.extracted_records_1 if unit_id == 1 else self.extracted_records_2
+        soc = record['soc']
+        existing = records.get(soc)
+        if existing is None or existing.get('video_sec') != record.get('video_sec'):
+            return
+        del records[soc]
+        selected = getattr(self, '_selected_record_preview', None)
+        if (selected and getattr(self, '_selected_record_unit', None) == unit_id
+                and selected.get('soc') == soc
+                and selected.get('video_sec') == record.get('video_sec')):
+            self._selected_record_preview = None
+            self._selected_record_unit = None
+            self.btn_locate_record.setEnabled(False)
+            self.lbl_frame_info.setText('当前画面对应的误识别记录已撤销')
+            self.lbl_status.setText('所选记录已撤销；当前画面仅供核对，不再作为有效记录。')
+        self.dirty_units.add(unit_id)
+        targets = get_target_soc_list(self.unit_modes[unit_id].currentData())
+        if soc not in targets:
+            return
+        table = self.table_1 if unit_id == 1 else self.table_2
+        row = targets.index(soc)
+        table.blockSignals(True)
+        try:
+            for column in (1, 2, 3):
+                table.item(row, column).setText('--')
+            table.item(row, 4).setText('误识别已撤销，等待重新检测')
+            table.item(row, 4).setToolTip(record['reason'])
+            table.item(row, 4).setForeground(QColor(180, 110, 0))
+        finally:
+            table.blockSignals(False)
 
     def on_worker_review_pending(self, unit_id, entry):
         if self._closing:
@@ -1521,6 +1571,16 @@ class MainWindow(QMainWindow):
             absent = sorted(targets - set(info['labels']))
             reasons = '；'.join(f'{reason} {count} 帧' for reason, count in info['rejected'].items()) or '无'
             diagnostics += (f'\n{unit}# 未捕获：{missing}\n尚无有效模板：{absent}\n拒绝原因：{reasons}\n')
+            skipped = info.get('skipped_templates', [])
+            if skipped:
+                labels = '、'.join(str(v) for v in sorted({s['label'] for s in skipped}))
+                diagnostics += (f'已跳过 {len(skipped)} 张位数不完整的样本（标注：{labels}%）；'
+                                '原图片和标注保留，可在样本库重新检查。\n')
+            corrections = info.get('corrections', [])
+            if corrections:
+                diagnostics += '原视频复验纠错：' + '；'.join(
+                    f"{r['old_soc']}% → {r['soc']}%（{r['video_sec']:.1f}s，{r['timing']}）"
+                    for r in corrections) + '\n'
             records = all_data_1 if unit == 1 else all_data_2
             pending = [entry for soc, entry in info.get('pending', {}).items()
                        if soc not in records]

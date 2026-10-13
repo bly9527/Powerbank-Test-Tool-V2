@@ -108,6 +108,47 @@ class SOCTrackerTests(unittest.TestCase):
         self.assertEqual(tracker.pending[30]['video_sec'], 101)
         self.assertIn('更多画面', tracker.pending[30]['reason'])
 
+    def test_verified_last_anchor_can_be_replaced_without_losing_first_frame(self):
+        tracker = SegmentSOCTracker('charge')
+        self.feed(tracker, [(0, 97), (1, 97), (2, 99), (3, 99)])
+        self.feed(tracker, [(10, 98), (11, 98), (12, 98), (13, 98)])
+        self.assertIsNotNone(tracker.correction_candidate())
+        self.assertIsNone(tracker.correct_last_anchor(97))
+        corrected = tracker.correct_last_anchor(99)
+        self.assertEqual((corrected.value, corrected.first_sec, corrected.payload),
+                         (98, 10, ('frame', 10)))
+        self.assertNotIn(98, tracker.pending)
+        later = self.feed(tracker, [(20, 99), (21, 99)])
+        self.assertEqual(later[0].first_sec, 20)
+
+    def test_return_to_previous_anchor_preserves_its_time_and_rate(self):
+        tracker = SegmentSOCTracker('charge')
+        self.feed(tracker, [(0, 96), (1, 96), (60, 97), (61, 97), (70, 99), (71, 99)])
+        self.feed(tracker, [(sec, 97) for sec in range(100, 104)])
+        corrected = tracker.correct_last_anchor(99)
+        self.assertEqual(corrected.value, 97)
+        self.assertEqual(tracker.last_change_sec, 60)
+        self.assertEqual(tracker._anchors, [(96, 0), (97, 60)])
+        self.assertEqual(list(tracker._seconds_per_percent), [60])
+        self.feed(tracker, [(120, 98), (121, 98)])
+        self.assertEqual(list(tracker._seconds_per_percent), [60, 60])
+
+    def test_reverse_beyond_previous_anchor_cannot_be_corrected(self):
+        tracker = SegmentSOCTracker('charge')
+        self.feed(tracker, [(0, 97), (1, 97), (2, 99), (3, 99)])
+        self.feed(tracker, [(i, 96) for i in range(10, 20)])
+        self.assertIsNone(tracker.correction_candidate())
+        self.assertIsNone(tracker.correct_last_anchor(99))
+        self.assertEqual(tracker.confirmed, 99)
+
+    def test_discharge_correction_preserves_direction_checks(self):
+        tracker = SegmentSOCTracker('discharge')
+        self.feed(tracker, [(0, 10), (1, 10), (2, 8), (3, 8)])
+        self.feed(tracker, [(i, 9) for i in range(10, 14)])
+        corrected = tracker.correct_last_anchor(8)
+        self.assertEqual((corrected.value, corrected.first_sec), (9, 10))
+        self.assertEqual([x.value for x in self.feed(tracker, [(20, 8), (21, 8)])], [8])
+
     def test_discharge_tail_all_single_digits_and_zero(self):
         tracker = SegmentSOCTracker('discharge')
         readings = [(i, v) for i, v in enumerate([v for v in range(10, -1, -1) for _ in range(2)])]

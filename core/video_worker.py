@@ -30,6 +30,7 @@ class VideoAnalysisWorker(QThread):
     # point_detected_signal: unit_id (1 或 2), record (dict)
     point_detected_signal = pyqtSignal(int, dict)
     review_pending_signal = pyqtSignal(int, dict)
+    point_revoked_signal = pyqtSignal(int, dict)
     # finished_signal: all_data_1, all_data_2
     finished_signal = pyqtSignal(dict, dict)
     # error_signal: 错误提示信息
@@ -57,6 +58,7 @@ class VideoAnalysisWorker(QThread):
         self.lcd_ignore_regions = {unit: validate_ignore_regions((lcd_ignore_regions or {}).get(unit, ()))
                                    for unit in (1, 2)}
         self.segment_diagnostics = {}
+        self._correction_checks = set()
 
         # 兼容单样机或旧参数调用
         self.roi_soc_1 = roi_soc_1 if roi_soc_1 is not None else roi_soc
@@ -131,6 +133,54 @@ class VideoAnalysisWorker(QThread):
                 # 充电模式：电量单调递增，单次允许跳增 0 ~ 5%
                 return 0 <= (current_val - confirmed_val) <= 5
 
+    def _verify_old_segment_record(self, unit, record, replacement, matcher):
+        """Use a separate decoder so verification cannot move the analysis cursor.
+
+        A missing match is NOT evidence. Require three distinct nearby frames to
+        explicitly support the replacement after matcher validation. Multiple
+        contradictory readings, or any very strong contradiction, abort.
+        """
+        cap = cv2.VideoCapture(self.video_path)
+        reason = getattr(matcher, 'last_reason', None)
+        try:
+            if not cap.isOpened():
+                return False
+            seen, votes, conflicts = set(), 0, 0
+            first_frame = None
+            for offset in (-1.5, -1., -.5, 0., .5, 1., 1.5):
+                if not self.is_running:
+                    return False
+                ok, frame = read_frame_at(cap, max(0., record['video_sec'] + offset))
+                if not ok:
+                    continue
+                index = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+                actual_sec = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
+                original_index = record.get('frame_index')
+                is_original = (index == original_index if original_index is not None else
+                               abs(actual_sec - record['video_sec']) < .05)
+                if index in seen:
+                    continue
+                seen.add(index)
+                value, score = matcher.extract_soc(self.crop(
+                    frame, getattr(self, f'roi_soc_{unit}'), getattr(self, f'rot_soc_{unit}')))
+                if is_original and value == record['soc']:
+                    # A readable original frame supports the old event; its
+                    # neighbours cannot vote away that direct evidence.
+                    return False
+                if value is not None and value != replacement:
+                    conflicts += 1
+                    if score >= .94 or conflicts > 1:
+                        return False
+                if value == replacement and score >= .85:
+                    votes += 1
+                    if is_original:
+                        first_frame = (frame.copy(), index, actual_sec)
+            return {'first_frame': first_frame} if votes >= 3 else False
+        finally:
+            cap.release()
+            if reason is not None:
+                matcher.last_reason = reason
+
     def _process_segment_soc(self, unit, frame, seconds, matcher, tracker, records, last_capacity):
         value, _ = matcher.extract_soc(self.crop(frame, getattr(self, f'roi_soc_{unit}'),
                                                getattr(self, f'rot_soc_{unit}')))
@@ -144,15 +194,48 @@ class VideoAnalysisWorker(QThread):
 
         accepted = tracker.update(value, seconds, capture)
         diagnostics = self.segment_diagnostics[unit]
+        candidate = tracker.correction_candidate()
+        if accepted is None and candidate is not None and tracker.confirmed in records:
+            old = records[tracker.confirmed]
+            key = (unit, old['soc'], old['video_sec'], candidate.value)
+            if key not in self._correction_checks:
+                self._correction_checks.add(key)
+                verification = self._verify_old_segment_record(unit, old, candidate.value, matcher)
+                if verification:
+                    verified_payload = None
+                    verified_sec = None
+                    if verification.get('first_frame') is not None:
+                        old_frame, old_index, verified_sec = verification['first_frame']
+                        verified_payload = (
+                            self.crop(old_frame, getattr(self, f'roi_time_{unit}'),
+                                      getattr(self, f'rot_time_{unit}')).copy(),
+                            self.crop(old_frame, getattr(self, f'roi_cap_{unit}'),
+                                      getattr(self, f'rot_cap_{unit}')).copy(), old_frame, old_index)
+                    accepted = tracker.correct_last_anchor(old['soc'], verified_sec, verified_payload)
+                    if accepted is not None:
+                        del records[old['soc']]
+                        revoked = dict(old, reason='原时段多帧复验与旧电量矛盾，已撤销误识别')
+                        self.point_revoked_signal.emit(unit, revoked)
+                        diagnostics.setdefault('corrections', []).append({
+                            'old_soc': old['soc'], 'soc': accepted.value,
+                            'old_video_sec': old['video_sec'], 'video_sec': accepted.first_sec,
+                            'timing': ('旧首帧明确复验，保留原时刻' if verified_payload is not None else
+                                       '保留新候选首帧；邻域复验不能证明旧首帧电量')})
+                        # Do not carry capacity from the revoked reading into a
+                        # replacement whose own capacity OCR fails.
+                        last_capacity = next((r['capacity'] for r in reversed(list(records.values()))
+                                              if r.get('capacity') is not None), None)
         if value is None:
             reason = getattr(matcher, 'last_reason', '未识别').split('：')[0]
             diagnostics['rejected'][reason] += 1
         elif tracker.last_rejection:
             diagnostics['rejected'][tracker.last_rejection] += 1
-        if tracker.new_pending:
+        if tracker.new_pending and accepted is None:
             self.review_pending_signal.emit(unit, dict(tracker.new_pending))
-        if accepted is None or accepted.value in records:
+        if accepted is None:
             return value, None
+        if accepted.value in records:
+            return value, records[accepted.value]
 
         time_image, capacity_image, evidence_frame, evidence_index = accepted.payload
         time_str, time_obj, _ = self.ocr_engine.extract_time(time_image)
@@ -221,7 +304,8 @@ class VideoAnalysisWorker(QThread):
                         tracker = SegmentSOCTracker(self.modes[unit], self.debounce_count, self.sample_interval)
                         segment_trackers[unit] = tracker
                         self.segment_diagnostics[unit] = {'labels': sorted(matcher.labels),
-                                                          'rejected': Counter(), 'pending': tracker.pending}
+                                                          'rejected': Counter(), 'pending': tracker.pending,
+                                                          'skipped_templates': getattr(matcher, 'skipped_templates', [])}
 
             # 1# 样机状态追踪
             confirmed_soc_1 = None
@@ -402,9 +486,9 @@ class VideoAnalysisWorker(QThread):
                 # ==========================================
                 progress_pct = int((cur_sec / max(total_duration, 1.0)) * 100)
                 soc1_disp = f"{confirmed_soc_1}%" if confirmed_soc_1 is not None else ("--" if has_unit_1 else "未启用")
-                cap1_disp = f"{last_valid_cap_1:.4f} Ah" if has_unit_1 else "未启用"
+                cap1_disp = (f"{last_valid_cap_1:.4f} Ah" if last_valid_cap_1 is not None else "--") if has_unit_1 else "未启用"
                 soc2_disp = f"{confirmed_soc_2}%" if confirmed_soc_2 is not None else ("--" if has_unit_2 else "未启用")
-                cap2_disp = f"{last_valid_cap_2:.4f} Ah" if has_unit_2 else "未启用"
+                cap2_disp = (f"{last_valid_cap_2:.4f} Ah" if last_valid_cap_2 is not None else "--") if has_unit_2 else "未启用"
 
                 self.progress_signal.emit(
                     cur_sec, total_duration, progress_pct,

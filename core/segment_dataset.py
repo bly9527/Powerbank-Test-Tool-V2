@@ -390,11 +390,17 @@ def feature(image, ignore_regions=()):
         return None
     lo, hi = np.percentile(values, [10, 99])
     if hi - lo < 25:
-        return None
+        # A narrow 1 can occupy less than one percent of a generously drawn
+        # ROI. Measure its bright tail before declaring the entire ROI dark.
+        if values.size < 8:
+            return None
+        hi = np.partition(values.ravel(), -8)[-8]
+        if hi - lo < 25:
+            return None
     mask = np.uint8(gray > lo + .50 * (hi - lo)) * 255
     if ignored is not None:
         mask[ignored] = 0
-    if not .015 < np.count_nonzero(mask) / values.size < .65:
+    if np.count_nonzero(mask) < 8 or np.count_nonzero(mask) / values.size >= .65:
         return None
     # Closing is for finding the bounds only: keep the original strokes for
     # comparison. The vertical kernel reconnects the two strokes of digit 1.
@@ -433,6 +439,17 @@ def feature(image, ignore_regions=()):
     if tallest < 8:
         return None
     digits = [s for s in components if s[cv2.CC_STAT_HEIGHT] >= tallest*.65]
+    # Thin disconnected top/bottom/left strokes need not become tall connected
+    # components. Include nearby original strokes in the bounds; otherwise a
+    # 9 loses its upper-left stroke and normalizes to exactly the same image as
+    # 3. Use the fixed anchors, not a growing flood-fill that could reach icons.
+    proximity = max(2, int(np.ceil(tallest * .2)))
+    _, _, original, _ = cv2.connectedComponentsWithStats(mask)
+    neighbours = [s for s in original[1:] if s[cv2.CC_STAT_AREA] >= 3 and any(
+        s[0] <= a[0]+a[2]+proximity and s[0]+s[2] >= a[0]-proximity and
+        s[1] >= a[1]-proximity and s[1]+s[3] <= a[1]+a[3]+proximity
+        for a in digits)]
+    digits += neighbours
     x1 = max(0, min(s[0] for s in digits)-2)
     y1 = max(0, min(s[1] for s in digits)-2)
     x2 = min(mask.shape[1], max(s[0]+s[2] for s in digits)+2)
@@ -449,8 +466,49 @@ def feature(image, ignore_regions=()):
     return canvas
 
 
+def stroke_grid(image):
+    """Local stroke coverage after alignment; background must not dilute a gap.
+
+    Smoothing tolerates antialiasing, while small cells keep the lower-left
+    stroke of 8 (or upper-left of 9) significant in a two-digit display.
+    """
+    blurred = cv2.GaussianBlur(image.astype(np.float32) / 255., (3, 3), 0)
+    grid = cv2.resize(blurred, (13, 9), interpolation=cv2.INTER_AREA)
+    # Coverage must be relative to the stroke width: a missing one-pixel
+    # segment is as significant as a missing thick segment.
+    return grid / max(.15, float(grid.max()))
+
+
+def supports_label_width(image, label):
+    """Reject lone-stroke multi-digit annotations, but retain narrow 11 fonts."""
+    if type(label) is not int or label < 10:
+        return True
+    ink = image > 32
+    ys, xs = np.where(ink)
+    height = ys.max()-ys.min()+1
+    if (xs.max()-xs.min()+1) / height >= (.5 if label < 100 else .9):
+        return True
+    # Aspect alone cannot distinguish one wide stroke from two narrow 1s.
+    # Count separated full-height groups, not the two halves of a slanted 1.
+    columns = np.flatnonzero(ink.any(axis=0))
+    groups = np.split(columns, np.where(np.diff(columns) > 1)[0]+1)
+    tall_groups = 0
+    for group in groups:
+        rows = np.flatnonzero(ink[:, group].any(axis=1))
+        if rows.size and rows[-1]-rows[0]+1 >= height*.65:
+            tall_groups += 1
+    return tall_groups >= len(str(label))
+
+
 class SegmentMatcher:
-    def __init__(self, root, threshold=.88, margin=.015, *, executor=None, workers=1):
+    # Correlation alone used to accept a wrong digit at .95. These are joint
+    # criteria: overall coverage, worst local stroke disagreement, and the
+    # margin against a competing label. A lower correlation is only useful
+    # when the discriminating strokes also agree.
+    STROKE_PENALTY = .30
+    MAX_STROKE_MISMATCH = .45
+
+    def __init__(self, root, threshold=.78, margin=.015, *, executor=None, workers=1):
         # The analysis worker owns the executor; matching never starts nested pools.
         self.executor = executor
         self.workers = max(1, int(workers))
@@ -459,6 +517,7 @@ class SegmentMatcher:
         self.threshold, self.margin = threshold, margin
         self.templates = []
         self.template_regions = []
+        self.skipped_templates = []
         self.last_reason = '尚未匹配'
         seen = set()
         for library in self.roots:
@@ -470,11 +529,19 @@ class SegmentMatcher:
                 if label != 'invalid' and (type(label) is not int or not 0 <= label <= 100):
                     continue
                 img = feature(read_image(path), regions)
+                if img is not None and not supports_label_width(img, label):
+                    # A lone thin stroke cannot teach a two/three-digit label.
+                    # Keep user annotations untouched, merely exclude this
+                    # unusable example (e.g. a blinking 19 captured as just 1).
+                    self.skipped_templates.append({'path': str(path), 'label': label,
+                                                   'reason': '画面宽度不足以支持标注位数'})
+                    continue
                 if img is not None and (label, regions, img.tobytes()) not in seen:
                     seen.add((label, regions, img.tobytes()))
                     self.templates.append((label, img))
                     self.template_regions.append(regions)
         self.template_ink = [float(template.sum()) for _, template in self.templates]
+        self.template_grids = [stroke_grid(template) for _, template in self.templates]
         self.labels = {label for label, _ in self.templates if type(label) is int}
 
     def extract_soc(self, image):
@@ -483,8 +550,16 @@ class SegmentMatcher:
             self.last_reason = '数字画面不完整或模板没有有效标签'
             return None, 0.0
         # Small translations tolerated, but ambiguous digits are rejected.
-        prepared = {regions: (cv2.copyMakeBorder(c, 3, 3, 3, 3, cv2.BORDER_CONSTANT), float(c.sum()))
-                    for regions, c in candidates.items() if c is not None}
+        prepared = {}
+        for regions, c in candidates.items():
+            if c is None:
+                continue
+            padded = cv2.copyMakeBorder(c, 3, 3, 3, 3, cv2.BORDER_CONSTANT)
+            # Precompute all possible aligned grids once, shared read-only by
+            # scoring threads, rather than blurring once per library sample.
+            grids = [[stroke_grid(padded[y:y+72, x:x+104]) for x in range(7)]
+                     for y in range(7)]
+            prepared[regions] = (padded, float(c.sum()), grids)
         scores = {}
         if self.executor is not None and self.workers > 1 and len(self.templates) > 64:
             size = max(64, (len(self.templates) + self.workers - 1) // self.workers)
@@ -494,22 +569,34 @@ class SegmentMatcher:
             # Merge in original template order so ties keep the serial decision.
             for future in futures:
                 for label, score in future.result().items():
-                    scores[label] = max(scores.get(label, -1), score)
+                    previous = scores.get(label, (-1., 0., 1.))
+                    scores[label] = max(previous, score, key=self._evidence_key)
         else:
             scores = self._score_templates(prepared, 0, len(self.templates))
-        ranked = sorted(scores.items(), key=lambda pair: pair[1], reverse=True)
-        label, score = ranked[0]
-        runner_up = ranked[1][1] if len(ranked) > 1 else -1
+        ranked = sorted(scores.items(), key=lambda pair: self._evidence_key(pair[1]), reverse=True)
+        label, (structure, score, mismatch) = ranked[0]
+        runner_up = (ranked[1][1][0] if len(ranked) > 1 and self._admissible(ranked[1][1]) else -1)
         if label == 'invalid':
             self.last_reason = '匹配到不可辨认样本'
-        elif score < self.threshold:
-            self.last_reason = f'相似度不足：{score:.3f} < {self.threshold:.3f}'
-        elif len(ranked) > 1 and score - runner_up < (.005 if ranked[1][0] == 'invalid' else self.margin):
-            self.last_reason = f'候选难以区分：{label}% / {ranked[1][0]}，差值 {score-runner_up:.3f}'
+        elif not self._admissible((structure, score, mismatch)):
+            self.last_reason = (f'笔画证据不足：相似度 {score:.3f}，'
+                                f'结构分 {structure:.3f}，局部差异 {mismatch:.3f}')
+        elif len(ranked) > 1 and structure - runner_up < (.005 if ranked[1][0] == 'invalid' else self.margin):
+            self.last_reason = f'候选难以区分：{label}% / {ranked[1][0]}，差值 {structure-runner_up:.3f}'
         else:
             self.last_reason = f'匹配 {label}%，相似度 {score:.3f}'
             return label, score
         return None, max(0.0, score)
+
+    def _admissible(self, evidence):
+        structure, correlation, mismatch = evidence
+        return (correlation >= self.threshold and structure >= self.threshold - .06
+                and mismatch <= self.MAX_STROKE_MISMATCH)
+
+    def _evidence_key(self, evidence):
+        # Adding a poor sample must not displace a valid sample of the SAME
+        # label. Rejected samples also cannot create a false runner-up margin.
+        return self._admissible(evidence), evidence[0]
 
     def _score_templates(self, prepared, start, end):
         scores = {}
@@ -518,12 +605,16 @@ class SegmentMatcher:
             template_ink, regions = self.template_ink[index], self.template_regions[index]
             if regions not in prepared:
                 continue
-            padded, candidate_ink = prepared[regions]
-            correlation = float(cv2.minMaxLoc(cv2.matchTemplate(padded, template, cv2.TM_CCOEFF_NORMED))[1])
+            padded, candidate_ink, grids = prepared[regions]
+            _, correlation, _, (x, y) = cv2.minMaxLoc(
+                cv2.matchTemplate(padded, template, cv2.TM_CCOEFF_NORMED))
             # An icon-only blink may correlate with a digit. Penalize missing
             # illuminated strokes, while tolerating brighter/thicker real digits.
             score = correlation * min(1.0, candidate_ink / template_ink)
-            scores[label] = max(scores.get(label, -1), score)
+            mismatch = float(np.max(np.abs(grids[y][x] - self.template_grids[index])))
+            evidence = (score - self.STROKE_PENALTY*mismatch, score, mismatch)
+            scores[label] = max(scores.get(label, (-1., 0., 1.)), evidence,
+                                key=self._evidence_key)
         return scores
 
 

@@ -40,6 +40,7 @@ class SegmentSOCTracker:
         self._last_sample_sec = None
         self._last_readable_sec = None
         self._missing_since_sec = None
+        self._anchors = []
 
     @property
     def needs_probe(self):
@@ -128,14 +129,67 @@ class SegmentSOCTracker:
                     self.new_pending = entry
             return None
 
+        return self._accept(candidate, seconds)
+
+    def _accept(self, candidate, seconds):
+        value = candidate.value
+        diff = self._difference(value) if self.confirmed is not None else 0
         if (self.confirmed is not None and 0 < diff <= 5 and
                 self.last_change_sec is not None):
             duration = candidate.first_sec - self.last_change_sec
             if duration > 0:
                 self._seconds_per_percent.append(duration / diff)
+        if value != self.confirmed:
+            self._anchors.append((value, candidate.first_sec))
+            self.last_change_sec = candidate.first_sec
         self.confirmed = value
-        self.last_change_sec = candidate.first_sec
         self.last_seen_sec = seconds
         self.pending.pop(value, None)
         self.candidate = None
         return candidate
+
+    def correction_candidate(self):
+        """Expose a sustained reverse episode for independent image verification."""
+        candidate = self.candidate
+        if (candidate is None or self.confirmed is None or
+                self._difference(candidate.value) >= 0 or
+                candidate.count < max(4, self.debounce_count + 2)):
+            return None
+        if len(self._anchors) > 1:
+            previous = self._anchors[-2][0]
+            diff = (candidate.value - previous if self.mode == 'charge'
+                    else previous - candidate.value)
+            if not 0 <= diff <= 5:
+                return None
+        return candidate
+
+    def correct_last_anchor(self, expected_value, verified_sec=None, verified_payload=None):
+        """Caller must first prove a contradictory reading in the OLD video frames.
+
+        Never relax normal direction checks. Only the most recent anchor can be
+        replaced; the current candidate keeps its original timestamp and payload.
+        """
+        candidate = self.correction_candidate()
+        if candidate is None or self.confirmed != expected_value or not self._anchors:
+            return None
+        if verified_sec is not None and verified_payload is not None:
+            # Only the independently re-decoded original frame may move time
+            # back. Neighbouring votes alone never invent an earlier transition.
+            if verified_sec < self._anchors[-1][1] - .05 or verified_sec > candidate.first_sec:
+                return None
+            candidate = SOCCandidate(candidate.value, verified_sec, candidate.gap_sec,
+                                     candidate.required_gap_sec, verified_payload, candidate.count)
+        self._anchors.pop()
+        if self._anchors:
+            self.confirmed, self.last_change_sec = self._anchors[-1]
+        else:
+            self.confirmed = self.last_change_sec = None
+        self._seconds_per_percent.clear()
+        # Restore rates from surviving anchors, excluding the disproved event.
+        for (old_value, old_sec), (new_value, new_sec) in zip(self._anchors, self._anchors[1:]):
+            diff = new_value - old_value if self.mode == 'charge' else old_value - new_value
+            if 0 < diff <= 5 and new_sec > old_sec:
+                self._seconds_per_percent.append((new_sec - old_sec) / diff)
+        self.pending.pop(expected_value, None)
+        self.last_rejection = None
+        return self._accept(candidate, self._last_sample_sec)

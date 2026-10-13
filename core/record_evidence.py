@@ -1,5 +1,6 @@
 """Exact recognition evidence, independent of approximate container frame seeks."""
 import os
+import math
 from pathlib import Path
 from uuid import uuid4
 
@@ -38,7 +39,12 @@ def locate_record(cap, record):
     Legacy records have no image identity and remain explicitly approximate.
     A bounded forward scan tolerates inaccurate MP4 seeks around keyframes.
     """
-    seconds = float(record['video_sec'])
+    try:
+        seconds = float(record.get('video_sec'))
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('记录缺少有效的视频位置，无法定位；测试时间不能代替视频位置') from None
+    if not math.isfinite(seconds) or seconds < 0 or isinstance(record.get('video_sec'), bool):
+        raise ValueError('记录的视频位置必须是大于等于零的有限秒数')
     expected = load_snapshot(record)
     ok, frame = read_frame_at(cap, seconds)
     if expected is None:

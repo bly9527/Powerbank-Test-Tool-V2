@@ -161,6 +161,38 @@ class RecordPreviewTests(unittest.TestCase):
                 self.assertEqual(window.extracted_records_1,{})
             finally:window.dirty_units.clear();window.close()
 
+    def test_invalid_video_positions_fail_clearly_before_decoding(self):
+        for value in (None, 'bad', float('nan'), float('inf'), -1, True):
+            with self.subTest(value=value), patch('core.record_evidence.read_frame_at', side_effect=AssertionError('must not decode')):
+                with self.assertRaises(ValueError):
+                    locate_record(object(), {'video_sec': value})
+        with self.assertRaises(ValueError):
+            locate_record(object(), {})
+
+    def test_manual_record_uses_video_column_never_test_clock(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem
+        from ui.main_window import MainWindow
+        table = QTableWidget(1, 5)
+        for col, text in enumerate(['99%', '00:15:00', '1.2', '24.5s', 'pending']):
+            table.setItem(0, col, QTableWidgetItem(text))
+        for value in (None, float('nan'), -1, 'bad', 24.512345):
+            rec = {'soc': 99, 'time_str': '00:15:00'}
+            if value is not None: rec['video_sec'] = value
+            window = SimpleNamespace(table_1=table, extracted_records_1={99: rec},
+                video_path='video.mp4', btn_locate_record=Mock(), locate_selected_record=Mock())
+            with patch('ui.main_window.load_snapshot', return_value=None):
+                MainWindow.on_table_cell_clicked(window, 0, 3, 1)
+            expected = 24.512345 if value == 24.512345 else 24.5
+            self.assertEqual(window._selected_record_preview['video_sec'], expected)
+            self.assertEqual(window._selected_record_unit, 1)
+            window.locate_selected_record.assert_called_once()
+        table.item(0, 3).setText('nan')
+        window.locate_selected_record.reset_mock()
+        MainWindow.on_table_cell_clicked(window, 0, 3, 1)
+        window.locate_selected_record.assert_not_called()
+
     def test_wrong_source_does_not_report_exact_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             rec=save_evidence(np.ones((12,12,3),np.uint8),'source.mp4',10,100,tmp)
