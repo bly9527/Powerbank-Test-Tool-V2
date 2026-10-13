@@ -406,6 +406,30 @@ def feature(image, ignore_regions=()):
     if not components:
         return None
     tallest = max(s[cv2.CC_STAT_HEIGHT] for s in components)
+    # Segment gaps scale with the displayed digits. A fixed five-pixel close
+    # can leave a 2 in two short pieces next to a connected 0; the height filter
+    # would then discard the 2 and teach the matcher that a lone 0 means 20.
+    # Reconnect at the observed digit scale, for bounds only (not the strokes).
+    gap_height = max(5, int(np.ceil(tallest * .4)) | 1)
+    if gap_height > 5:
+        anchors = [s for s in components if s[cv2.CC_STAT_HEIGHT] >= tallest*.65]
+        band_top = min(s[1] for s in anchors)
+        band_bottom = max(s[1]+s[3] for s in anchors)
+        tolerance = max(2, int(tallest*.2))
+        # Padding prevents closing from extending a digit to a nearby ROI edge.
+        padded = cv2.copyMakeBorder(mask, gap_height, gap_height, gap_height, gap_height,
+                                   cv2.BORDER_CONSTANT, value=0)
+        closed = cv2.morphologyEx(padded, cv2.MORPH_CLOSE, np.ones((gap_height, 3), np.uint8))
+        closed = closed[gap_height:-gap_height, gap_height:-gap_height]
+        if ignored is not None:
+            closed[ignored] = 0
+        _, _, stats, _ = cv2.connectedComponentsWithStats(closed)
+        # Keep the original anchors if a new join reaches an indicator outside
+        # the digit band. Only add reconnects consistent with the observed band.
+        components += [s for s in stats[1:] if s[cv2.CC_STAT_AREA] >= 5
+                       and s[1] >= band_top-tolerance
+                       and s[1]+s[3] <= band_bottom+tolerance]
+        tallest = max(s[cv2.CC_STAT_HEIGHT] for s in components)
     if tallest < 8:
         return None
     digits = [s for s in components if s[cv2.CC_STAT_HEIGHT] >= tallest*.65]

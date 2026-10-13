@@ -37,6 +37,96 @@ class LibraryTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
+    def test_annotation_advance_preserves_input_and_shows_existing_labels(self):
+        cases = ((None, 3, 1, 25), (80, 3, 1, 25), (None, 501, 499, 25),
+                 (None, 3, 1, 'invalid'), (None, 3, 1, None))
+        for destination_label, count, current, saved_label in cases:
+            with self.subTest(destination_label=destination_label, count=count), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                library = root / 'library'
+                folder = library / 'captures' / 'batch'
+                folder.mkdir(parents=True)
+                image = np.full((30, 50, 3), 120, np.uint8)
+                for index in {0, current, current + 1}:
+                    write_image(folder / f'{index}.png', image)
+                write_json(folder / 'manifest.json', dict(source='video.mp4', unit=1, interval=1,
+                    created_at=1, samples=[dict(image=f'{i}.png', video_sec=i, frame_index=i)
+                                           for i in range(count)]))
+                set_label(library, 'captures/batch/0.png', 99)
+                if saved_label is None:
+                    set_label(library, f'captures/batch/{current}.png', 17)
+                if destination_label is not None:
+                    set_label(library, f'captures/batch/{current + 1}.png', destination_label)
+                settings = QSettings(str(root / 'ui.ini'), QSettings.IniFormat)
+                with patch('core.segment_dataset.data_home', return_value=root), \
+                     patch('ui.segment_dialog.data_home', return_value=root), \
+                     patch('ui.segment_dialog.QSettings', return_value=settings):
+                    dialog = SegmentDatasetDialog({1: [str(library)], 2: [str(library)]})
+                    try:
+                        dialog.list.setCurrentRow(current)
+                        dialog.label_value.setValue(25)
+                        dialog.label_sample(saved_label)
+                        row = dialog.rows[dialog.list.currentRow()]
+                        self.assertEqual(row['key'], f'captures/batch/{current + 1}.png')
+                        self.assertEqual(dialog.label_value.value(), destination_label or 25)
+                        labels = read_json(library / 'labels.json', {})
+                        self.assertEqual(labels.get(f'captures/batch/{current}.png'), saved_label)
+                        self.assertEqual(labels['captures/batch/0.png'], 99)
+                        self.assertEqual(labels.get(row['key']), destination_label)
+                    finally:
+                        dialog.close()
+
+    def test_annotation_filtered_zero_index_restores_destination_label(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            library = root / 'library'
+            make_batch(library, 'first', 99, 2)
+            make_batch(library, 'second', 80, 1)
+            settings = QSettings(str(root / 'ui.ini'), QSettings.IniFormat)
+            with patch('core.segment_dataset.data_home', return_value=root), \
+                 patch('ui.segment_dialog.data_home', return_value=root), \
+                 patch('ui.segment_dialog.QSettings', return_value=settings):
+                dialog = SegmentDatasetDialog({1: [str(library)]})
+                try:
+                    dialog.batch.setCurrentIndex(dialog.batch.findData('*'))
+                    dialog.filter.setCurrentIndex(2)
+                    self.assertEqual(dialog.label_value.value(), 99)
+                    dialog.label_sample(None)
+                    self.assertEqual(dialog.list.currentRow(), 0)
+                    self.assertEqual(dialog.label_value.value(), 80)
+                    self.assertNotIn('captures/first/a.png', read_json(library / 'labels.json', {}))
+                finally:
+                    dialog.close()
+
+    def test_annotation_removing_last_filtered_page_preserves_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            library = root / 'library'
+            folder = library / 'captures' / 'batch'
+            folder.mkdir(parents=True)
+            for index in (0, 500):
+                write_image(folder / f'{index}.png', np.full((30, 50, 3), 120, np.uint8))
+            write_json(folder / 'manifest.json', dict(source='video.mp4', unit=1, interval=1,
+                created_at=1, samples=[dict(image=f'{i}.png', video_sec=i, frame_index=i)
+                                       for i in range(501)]))
+            settings = QSettings(str(root / 'ui.ini'), QSettings.IniFormat)
+            with patch('core.segment_dataset.data_home', return_value=root), \
+                 patch('ui.segment_dialog.data_home', return_value=root), \
+                 patch('ui.segment_dialog.QSettings', return_value=settings):
+                dialog = SegmentDatasetDialog({1: [str(library)]})
+                try:
+                    dialog.filter.setCurrentIndex(1)
+                    dialog.page.setValue(2)
+                    dialog.label_value.setValue(25)
+                    dialog.label_sample(25)
+                    self.assertEqual(dialog.page.value(), 1)
+                    self.assertEqual(dialog.page.maximum(), 1)
+                    self.assertEqual(dialog.label_value.value(), 25)
+                    self.assertEqual(dialog.rows[dialog.list.currentRow()]['key'], 'captures/batch/0.png')
+                    self.assertEqual(read_json(library / 'labels.json', {}), {'captures/batch/500.png': 25})
+                finally:
+                    dialog.close()
+
     def test_union_of_templates_and_conflicting_labels(self):
         with tempfile.TemporaryDirectory() as tmp:
             a,b = Path(tmp)/'a',Path(tmp)/'b'

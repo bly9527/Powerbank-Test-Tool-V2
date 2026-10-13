@@ -692,6 +692,7 @@ class SegmentDatasetDialog(QDialog):
         index = self.list.currentRow()
         if not 0 <= index < len(self.rows):
             return
+        input_value = label if type(label) is int else self.label_value.value()
         try:
             key = self.rows[index]['key']
             set_label(self.root(), key, label)
@@ -700,6 +701,9 @@ class SegmentDatasetDialog(QDialog):
             else:
                 self._labels[key] = label
             self.render_samples()
+            # Rebuilding selects row zero, whose saved label may change the input.
+            # Carry the user's last value to an unlabelled destination instead.
+            self.label_value.setValue(input_value)
             self.status.setText('已保存到当前模板。' if label is not None else '已保存：撤销了此标签，原图片保留。')
             # Filtered rows disappear after labelling; otherwise advance one row.
             step = 1 if self.filter.currentIndex() == 0 else 0
@@ -707,6 +711,9 @@ class SegmentDatasetDialog(QDialog):
                 self.page.setValue(self.page.value()+1)
             else:
                 self.list.setCurrentRow(min(index+step, len(self.rows)-1))
+                # Index zero may already be selected by render_samples; in that
+                # case Qt emits no change signal, but its saved label still wins.
+                self.show_sample(self.list.currentRow())
         except Exception as exc:
             QMessageBox.warning(self, '保存标签失败', str(exc))
 

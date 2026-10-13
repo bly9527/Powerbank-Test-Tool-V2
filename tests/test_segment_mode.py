@@ -21,6 +21,46 @@ class SegmentTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
+    def test_fragmented_leading_digit_is_not_discarded_from_template(self):
+        for scale in (1, 2):
+            with self.subTest(scale=scale), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                full = np.zeros((49, 76, 3), np.uint8)
+                cv2.rectangle(full, (36, 12), (48, 30), (255, 255, 255), 2)
+                zero = full.copy()
+                # Disconnected strokes: both are shorter than 65% of the 0.
+                cv2.rectangle(full, (23, 12), (32, 20), (255, 255, 255), -1)
+                cv2.rectangle(full, (19, 26), (28, 30), (255, 255, 255), -1)
+                if scale != 1:
+                    full = cv2.resize(full, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+                    zero = cv2.resize(zero, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+                write_image(root / 'twenty.png', full)
+                set_label(root, 'twenty.png', 20)
+                matcher = SegmentMatcher(root)
+                self.assertEqual(matcher.extract_soc(full)[0], 20)
+                self.assertIsNone(matcher.extract_soc(zero)[0])
+                write_image(root / 'zero.png', zero)
+                set_label(root, 'zero.png', 0)
+                matcher = SegmentMatcher(root)
+                self.assertEqual(matcher.extract_soc(zero)[0], 0)
+                self.assertEqual(matcher.extract_soc(full)[0], 20)
+
+    def test_fragment_join_does_not_absorb_lower_icon_or_extend_to_roi_edge(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            clean = np.zeros((90, 100, 3), np.uint8)
+            cv2.rectangle(clean, (35, 15), (55, 45), (255, 255, 255), 2)
+            write_image(root / 'zero.png', clean)
+            set_label(root, 'zero.png', 0)
+            matcher = SegmentMatcher(root)
+            icon = clean.copy()
+            cv2.rectangle(icon, (40, 54), (50, 58), (255, 255, 255), -1)
+            self.assertEqual(matcher.extract_soc(icon)[0], 0)
+            for top in range(4, 10):
+                shifted = np.zeros_like(clean)
+                cv2.rectangle(shifted, (35, top), (55, top+30), (255, 255, 255), 2)
+                self.assertEqual(matcher.extract_soc(shifted)[0], 0)
+
     def test_labelled_only_and_ambiguous_rejection(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
