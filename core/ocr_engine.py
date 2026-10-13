@@ -5,9 +5,10 @@ from datetime import time
 from rapidocr_onnxruntime import RapidOCR
 
 class OCREngine:
-    def __init__(self):
+    def __init__(self, cpu_threads=None):
         # 初始化 RapidOCR 引擎
-        self.ocr = RapidOCR()
+        self.ocr = (RapidOCR(intra_op_num_threads=int(cpu_threads), inter_op_num_threads=1)
+                    if cpu_threads else RapidOCR())
 
     def preprocess_soc_crop(self, crop_img):
         """
@@ -111,7 +112,7 @@ class OCREngine:
     def extract_time(self, crop_img):
         """
         从 Power-Z 截图中提取时间字符串与 datetime.time
-        常见格式: 00:02:36 或 0:02:36 或 02:36
+        支持时、分、秒各一至两位，例如 2:17:3、00:02:36 或 2:3。
         返回: (time_str, datetime.time对象, confidence)
         """
         if crop_img is None or crop_img.size == 0:
@@ -122,29 +123,76 @@ class OCREngine:
         if not res:
             return None, None, 0.0
 
-        # 按左到右排序
-        res.sort(key=lambda x: min(pt[0] for pt in x[0]))
-
-        for item in res:
-            text = item[1].strip()
-            score = float(item[2])
-            normalized = text.replace('：', ':').replace(';', ':')
-            # 匹配 hh:mm:ss
-            m3 = re.search(r'(\d{1,2}):(\d{2}):(\d{2})', normalized)
+        def parse_items(items):
+            # A time split into several OCR boxes must be reassembled within
+            # its row. Never accept a valid-looking prefix of malformed text.
+            ordered = sorted(items, key=lambda item: min(pt[0] for pt in item[0]))
+            text = ''.join(item[1].strip() for item in ordered)
+            normalized = re.sub(r'\s+', '', text.replace('：', ':').replace(';', ':').replace('；', ':'))
+            m3 = re.fullmatch(r'([0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2})', normalized)
+            m2 = re.fullmatch(r'([0-9]{1,2}):([0-9]{1,2})', normalized)
             if m3:
-                h, m, s = int(m3.group(1)), int(m3.group(2)), int(m3.group(3))
-                if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
-                    time_str = f"{h:02d}:{m:02d}:{s:02d}"
-                    return time_str, time(h, m, s), score
+                h, m, s = map(int, m3.groups())
+            elif m2:
+                h = 0
+                m, s = map(int, m2.groups())
+            else:
+                return None, None, 0.0
+            if not (0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60):
+                return None, None, 0.0
+            score = sum(float(item[2]) for item in items) / len(items)
+            return f'{h:02d}:{m:02d}:{s:02d}', time(h, m, s), score
 
-            # 匹配 mm:ss
-            m2 = re.search(r'(\d{1,2}):(\d{2})', normalized)
-            if m2:
-                m, s = int(m2.group(1)), int(m2.group(2))
-                if 0 <= m < 60 and 0 <= s < 60:
-                    time_str = f"00:{m:02d}:{s:02d}"
-                    return time_str, time(0, m, s), score
+        def parse_line(items):
+            whole = parse_items(items)
+            if whole[0] is not None:
+                return whole
+            ordered = sorted(items, key=lambda item: min(pt[0] for pt in item[0]))
+            candidates = []
+            for start in range(len(ordered)):
+                for end in range(start + 1, len(ordered) + 1):
+                    part = ordered[start:end]
+                    parsed = parse_items(part)
+                    if parsed[0] is None:
+                        continue
+                    left = min(pt[0] for item in part for pt in item[0])
+                    right = max(pt[0] for item in part for pt in item[0])
+                    height = max(max(pt[1] for pt in item[0]) - min(pt[1] for pt in item[0]) for item in part)
+                    others = ordered[:start] + ordered[end:]
+                    if any(any(char in entry[1] for char in ':：;；') for entry in others):
+                        continue
+                    # A neighboring digit can be a missing piece of a split
+                    # time. Capacity in the next table column is farther away.
+                    if any(any(ch.isdigit() for ch in entry[1]) and
+                           max(0, left - max(pt[0] for pt in entry[0]),
+                               min(pt[0] for pt in entry[0]) - right) <= max(8, height * .6)
+                           for entry in others):
+                        continue
+                    candidates.append((len(part), parsed))
+            if candidates and len({result[0] for _, result in candidates}) == 1:
+                return max(candidates, key=lambda item: item[0])[1]
+            return None, None, 0.0
 
+        whole = parse_line(res)
+        if whole[0] is not None:
+            return whole
+
+        # Power-Z shows "全部" and "窗口" on separate rows. OCR may return
+        # both times; concatenating them invalidates two correct readings.
+        lines = []
+        for item in sorted(res, key=lambda item: sum(pt[1] for pt in item[0]) / len(item[0])):
+            center_y = sum(pt[1] for pt in item[0]) / len(item[0])
+            height = max(pt[1] for pt in item[0]) - min(pt[1] for pt in item[0])
+            if lines and abs(center_y - lines[-1][0]) <= max(5, min(height, lines[-1][2]) * .55):
+                line_items = lines[-1][1] + [item]
+                center = sum(sum(pt[1] for pt in entry[0]) / len(entry[0]) for entry in line_items) / len(line_items)
+                lines[-1] = (center, line_items, max(lines[-1][2], height))
+            else:
+                lines.append((center_y, [item], height))
+        for _, items, _ in lines:
+            result = parse_line(items)
+            if result[0] is not None:
+                return result
         return None, None, 0.0
 
     def extract_capacity(self, crop_img, target_unit='Ah'):

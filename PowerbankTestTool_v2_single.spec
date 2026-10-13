@@ -1,0 +1,40 @@
+# -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+
+datas = [('PB519数显均匀度测试报告9.15（未测完）.xlsx', '.')]
+datas += collect_data_files('rapidocr_onnxruntime')
+binaries = collect_dynamic_libs('onnxruntime')
+
+a = Analysis(
+    ['main.py'],
+    pathex=[],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=['shapely', 'pyclipper', 'yaml'],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=['hook_onnx.py'],
+    excludes=['torch', 'torchvision', 'torchaudio', 'tensorflow', 'pandas'],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name='PowerbankTestTool_v2_单文件版',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)

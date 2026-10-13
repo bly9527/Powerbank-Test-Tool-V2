@@ -1,7 +1,9 @@
 from PyQt5.QtWidgets import QWidget
-from PyQt5.QtCore import Qt, QRect, QPoint, pyqtSignal
-from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QImage, QPixmap
+from PyQt5.QtCore import Qt, QRect, QRectF, QPoint, QPointF, pyqtSignal
+from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QImage, QPixmap, QPolygonF
+import math
 import numpy as np
+from core.roi_geometry import roi_corners, roi_in_bounds
 
 
 class VideoCanvas(QWidget):
@@ -67,6 +69,8 @@ class VideoCanvas(QWidget):
         self.is_drawing = False
         self.start_pt = None
         self.current_pt = None
+        self.rotating_roi = None
+        self.setToolTip('画框后拖动圆形旋转手柄，可360°自由旋转；双击手柄恢复0°。')
 
     def set_frame(self, cv_img):
         """设置当前帧图像 (OpenCV BGR numpy array)"""
@@ -85,6 +89,44 @@ class VideoCanvas(QWidget):
     def set_active_roi_type(self, roi_type):
         aliases = {'soc': 'soc_1', 'time': 'time_1', 'cap': 'cap_1'}
         self.active_roi_type = aliases.get(roi_type, roi_type)
+        self.update()
+
+    def set_roi_tilt(self, key, angle):
+        """Rotate the sampling rectangle; legacy text orientation stays separate."""
+        roi = self.rois.get(key)
+        if roi:
+            updated = tuple(roi[:4]) + (round(float(angle) % 360, 1) % 360,)
+            self.rois[key] = updated
+            self.roi_changed_signal.emit(key, updated)
+            self.update()
+
+    def widget_polygon(self, roi):
+        r = self.get_render_rect()
+        return QPolygonF([QPointF(r.x()+x/self.orig_w*r.width(),
+                                r.y()+y/self.orig_h*r.height())
+                          for x, y in roi_corners(roi)])
+
+    def rotation_handle(self, key):
+        roi = self.rois.get(key)
+        if not roi or not self.current_frame:
+            return None
+        points = self.widget_polygon(roi)
+        top = (points[0]+points[1])/2
+        centre = (points[0]+points[2])/2
+        delta = top-centre
+        length = math.hypot(delta.x(), delta.y())
+        # Place inside the frame when an outside handle would be off-screen.
+        outside = top+delta*(26/max(length, 1))
+        if not self.rect().adjusted(10, 10, -10, -10).contains(outside.toPoint()):
+            outside = top-delta*(min(22, length/2)/max(length, 1))
+        return top, outside, centre
+
+    def handle_at(self, position):
+        for key in (self.active_roi_type,):
+            handle = self.rotation_handle(key)
+            if handle and math.hypot(position.x()-handle[1].x(), position.y()-handle[1].y()) <= 12:
+                return key
+        return None
 
     def set_roi_rotation(self, roi_type, angle):
         """设置指定选区的旋转角度 (0, 90, 180, 270)"""
@@ -171,7 +213,7 @@ class VideoCanvas(QWidget):
         if not roi or not self.current_frame or self.orig_w == 0:
             return QRect()
         r = self.get_render_rect()
-        x, y, w, h = roi
+        x, y, w, h = roi[:4]
         wx = r.x() + int((x / self.orig_w) * r.width())
         wy = r.y() + int((y / self.orig_h) * r.height())
         ww = int((w / self.orig_w) * r.width())
@@ -180,17 +222,49 @@ class VideoCanvas(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton and self.active_roi_type and self.current_frame:
+            key = self.handle_at(event.pos())
+            if key:
+                self.rotating_roi = key
+                self.active_roi_type = key
+                centre = self.rotation_handle(key)[2]
+                self._rotation_start_pointer = math.degrees(math.atan2(event.y()-centre.y(), event.x()-centre.x()))
+                roi = self.rois[key]
+                self._rotation_start_angle = roi[4] if len(roi) == 5 else 0
+                self.setCursor(Qt.ClosedHandCursor)
+                self.update()
+                return
             self.is_drawing = True
             self.start_pt = event.pos()
             self.current_pt = event.pos()
             self.update()
 
     def mouseMoveEvent(self, event):
-        if self.is_drawing:
+        if self.rotating_roi:
+            centre = self.rotation_handle(self.rotating_roi)[2]
+            pointer = math.degrees(math.atan2(event.y()-centre.y(), event.x()-centre.x()))
+            self.set_roi_tilt(self.rotating_roi, self._rotation_start_angle+pointer-self._rotation_start_pointer)
+        elif self.is_drawing:
             self.current_pt = event.pos()
             self.update()
+        else:
+            self.setCursor(Qt.OpenHandCursor if self.handle_at(event.pos()) else Qt.CrossCursor)
+
+    def mouseDoubleClickEvent(self, event):
+        key = self.handle_at(event.pos()) if event.button() == Qt.LeftButton else None
+        if key:
+            self.rotating_roi = None
+            self.is_drawing = False
+            self.set_roi_tilt(key, 0)
+            self.unsetCursor()
+        else:
+            super().mouseDoubleClickEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.rotating_roi:
+            self.mouseMoveEvent(event)
+            self.rotating_roi = None
+            self.unsetCursor()
+            return
         if event.button() == Qt.LeftButton and self.is_drawing:
             self.is_drawing = False
             self.current_pt = event.pos()
@@ -235,29 +309,29 @@ class VideoCanvas(QWidget):
 
         for roi_type, roi in self.rois.items():
             if roi:
-                qrect = self.orig_to_widget_rect(roi)
+                polygon = self.widget_polygon(roi)
+                qrect = polygon.boundingRect().toRect()
                 color = self.colors.get(roi_type, QColor(255, 255, 255))
+                valid = roi_in_bounds(roi, self.orig_w, self.orig_h)
+                if not valid:
+                    color = QColor(255, 40, 40)
                 rot = self.rotations.get(roi_type, 0)
 
                 # 边框
-                pen = QPen(color, 2, Qt.SolidLine)
+                pen = QPen(color, 1, Qt.SolidLine)
+                pen.setCosmetic(True)
                 painter.setPen(pen)
-                # 半透明填充
-                fill_color = QColor(color.red(), color.green(), color.blue(), 40)
-                painter.fillRect(qrect, fill_color)
-                painter.drawRect(qrect)
+                # Keep the selected pixels unobscured while drawing the outline.
+                painter.setBrush(Qt.NoBrush)
+                painter.drawPolygon(polygon)
+                painter.setBrush(Qt.NoBrush)
 
-                # 绘制文字顶部朝向指示条 (粗线指示哪边为文字正上方)
-                dir_pen = QPen(QColor(255, 255, 0), 4, Qt.SolidLine)
+                # A thin yellow edge indicates the text's top without hiding strokes.
+                dir_pen = QPen(QColor(255, 255, 0), 1, Qt.SolidLine)
+                dir_pen.setCosmetic(True)
                 painter.setPen(dir_pen)
-                if rot == 0:
-                    painter.drawLine(qrect.topLeft(), qrect.topRight())
-                elif rot == 90:
-                    painter.drawLine(qrect.topRight(), qrect.bottomRight())
-                elif rot == 180:
-                    painter.drawLine(qrect.bottomLeft(), qrect.bottomRight())
-                elif rot == 270:
-                    painter.drawLine(qrect.topLeft(), qrect.bottomLeft())
+                edge = (int(rot)//90) % 4
+                painter.drawLine(polygon[edge], polygon[(edge+1) % 4])
 
                 # 标签角标 (带旋转朝向说明)
                 rot_text = ""
@@ -267,6 +341,10 @@ class VideoCanvas(QWidget):
                     rot_text = " ↻180°倒立"
                 elif rot == 270:
                     rot_text = " ↺90°侧放"
+                tilt = roi[4] if len(roi) == 5 else 0
+                rot_text += f' · 框{tilt:g}°'
+                if not valid:
+                    rot_text += ' 超出边界'
 
                 label = f"[{self.names.get(roi_type, roi_type)}{rot_text}]"
                 label_w = len(label) * 11 + 16
@@ -276,10 +354,25 @@ class VideoCanvas(QWidget):
                 painter.setFont(font)
                 painter.drawText(label_rect, Qt.AlignCenter, label)
 
+                if roi_type == self.active_roi_type:
+                    top, handle, centre = self.rotation_handle(roi_type)
+                    painter.setPen(QPen(color, 2))
+                    painter.drawLine(top, handle)
+                    painter.setBrush(QColor(255, 255, 255))
+                    painter.drawEllipse(handle, 8, 8)
+                    # Vector icon remains visible even if a font lacks ↻.
+                    painter.setPen(QPen(QColor(30, 30, 30), 1.3))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawArc(QRectF(handle.x()-4, handle.y()-4, 8, 8), 30*16, 300*16)
+                    painter.drawLine(handle+QPointF(3.5, 2), handle+QPointF(.5, 2.5))
+                    painter.drawLine(handle+QPointF(3.5, 2), handle+QPointF(4, 5))
+                    painter.setBrush(Qt.NoBrush)
+
         # 4. 绘制当前拖拽中的框
         if self.is_drawing and self.start_pt and self.current_pt:
             color = self.colors.get(self.active_roi_type, QColor(255, 255, 255))
-            pen = QPen(color, 2, Qt.DashLine)
+            pen = QPen(color, 1, Qt.DashLine)
+            pen.setCosmetic(True)
             painter.setPen(pen)
 
             dx = self.current_pt.x() - self.start_pt.x()

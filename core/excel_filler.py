@@ -122,36 +122,39 @@ def scan_excel_test_groups(excel_path):
     """
     groups = {}
     wb = openpyxl.load_workbook(excel_path, data_only=True)
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        sheet_groups = []
-        for r in range(1, ws.max_row + 1):
-            # 扫描 1# (列 1)
-            val1 = ws.cell(r, 1).value
-            if val1 and ('PB' in str(val1) or '放电' in str(val1) or '充电' in str(val1)):
-                base_row = r - 2 if r >= 2 else 0
-                sheet_groups.append({
-                    'name': str(val1).strip(),
-                    'base_row': base_row,
-                    'title_row': r,
-                    'sheet': sheet_name,
-                    'col_offset': 0
-                })
+    try:
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            sheet_groups = []
+            for r in range(1, ws.max_row + 1):
+                # 扫描 1# (列 1)
+                val1 = ws.cell(r, 1).value
+                if val1 and ('PB' in str(val1) or '放电' in str(val1) or '充电' in str(val1)):
+                    base_row = r - 2 if r >= 2 else 0
+                    sheet_groups.append({
+                        'name': str(val1).strip(),
+                        'base_row': base_row,
+                        'title_row': r,
+                        'sheet': sheet_name,
+                        'col_offset': 0
+                    })
 
-            # 扫描 2# (列 15)
-            val2 = ws.cell(r, 15).value
-            if val2 and ('PB' in str(val2) or '放电' in str(val2) or '充电' in str(val2)):
-                base_row = r - 2 if r >= 2 else 0
-                sheet_groups.append({
-                    'name': str(val2).strip(),
-                    'base_row': base_row,
-                    'title_row': r,
-                    'sheet': sheet_name,
-                    'col_offset': 14
-                })
+                # 扫描 2# (列 15)
+                val2 = ws.cell(r, 15).value
+                if val2 and ('PB' in str(val2) or '放电' in str(val2) or '充电' in str(val2)):
+                    base_row = r - 2 if r >= 2 else 0
+                    sheet_groups.append({
+                        'name': str(val2).strip(),
+                        'base_row': base_row,
+                        'title_row': r,
+                        'sheet': sheet_name,
+                        'col_offset': 14
+                    })
 
-        if sheet_groups:
-            groups[sheet_name] = sheet_groups
+            if sheet_groups:
+                groups[sheet_name] = sheet_groups
+    finally:
+        wb.close()
     return groups
 
 def fill_excel_report(excel_path, sheet_name, base_row, mode,

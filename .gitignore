@@ -9,8 +9,16 @@ venv/
 env.bak/
 venv.bak/
 build/
+build_lean/
+build_single/
 develop-eggs/
 dist/
+dist_lean/
+dist_optimized/
+release/
+_bmad/
+_bmad-output/
+测试结果/
 downloads/
 eggs/
 .eggs/
