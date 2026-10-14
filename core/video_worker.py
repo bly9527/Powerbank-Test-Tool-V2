@@ -1,4 +1,5 @@
 # 必须在最顶部导入 onnxruntime，避免 Windows 下 C++ 运行时 DLL 冲突
+from core.runtime_bootstrap import prepare_runtime
 import onnxruntime
 import cv2
 import time as pytime
@@ -38,6 +39,7 @@ class VideoAnalysisWorker(QThread):
     finished_signal = pyqtSignal(dict, dict)
     # error_signal: 错误提示信息
     error_signal = pyqtSignal(str)
+    backend_signal = pyqtSignal(str)
 
     def __init__(self, video_path,
                  roi_soc_1=None, roi_time_1=None, roi_cap_1=None,
@@ -51,6 +53,7 @@ class VideoAnalysisWorker(QThread):
                  segment_paths=None,
                  cpu_threads=None,
                  high_speed=False,
+                 gpu=False, gpu_device=0,
                  visual_tracking=None,
                  meter_single_line=None,
                  timing_refine=None,
@@ -107,6 +110,8 @@ class VideoAnalysisWorker(QThread):
         self.active_units = set(active_units or (1, 2))
         self.cpu_threads = cpu_threads
         self.high_speed = bool(high_speed)
+        self.gpu = bool(gpu)
+        self.gpu_device = int(gpu_device)
         self.sample_interval = max(0.2, float(sample_interval_sec))
         self.debounce_count = max(1, int(debounce_count))
         self.cap_unit = cap_unit  # 'Ah' 或 'mAh'
@@ -312,15 +317,20 @@ class VideoAnalysisWorker(QThread):
         pool = None
         previous_cv_threads = cv2.getNumThreads()
         try:
-            threads = high_speed_threads() if self.high_speed else self.cpu_threads
-            if self.high_speed and self.digit_type == SEGMENT_MODE:
+            threads = self.cpu_threads or (high_speed_threads() if self.high_speed else None)
+            if (self.high_speed or (threads and threads > 1)) and self.digit_type == SEGMENT_MODE:
                 # Parallelize independent templates, not frames or tracker updates.
                 cv2.setNumThreads(1)
                 pool = ThreadPoolExecutor(max_workers=threads, thread_name_prefix='segment-match')
             elif threads:
                 cv2.setNumThreads(threads)
             # 在工作线程内部初始化 OCR 引擎
-            self.ocr_engine = OCREngine(cpu_threads=threads) if threads else OCREngine()
+            if self.gpu:
+                self.ocr_engine = OCREngine(cpu_threads=threads, gpu=True, gpu_device=self.gpu_device,
+                                            backend_callback=self.backend_signal.emit)
+            else:
+                self.ocr_engine = OCREngine(cpu_threads=threads) if threads else OCREngine()
+                self.backend_signal.emit('OCR：CPU')
 
             cap = cv2.VideoCapture(self.video_path)
             if not cap.isOpened():

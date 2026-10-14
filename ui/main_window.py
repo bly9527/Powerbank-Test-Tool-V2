@@ -1,4 +1,5 @@
 # 必须在最顶部导入 onnxruntime，避免 Windows 下 C++ 运行时 DLL 冲突
+from core.runtime_bootstrap import prepare_runtime
 import onnxruntime
 import os
 import math
@@ -37,6 +38,7 @@ from core.project_archive import (ProjectArchive, create_project, delete_project
     project_catalog, group_key)
 from core.resource_monitor import ResourceMonitor
 from core.performance import high_speed_threads
+from core.gpu_backend import directml_devices, preferred_device
 from core.visual_tracking import suggested_range
 from ui.manual_capture_dialog import ManualCaptureDialog
 
@@ -381,15 +383,16 @@ class MainWindow(QMainWindow):
         resource_layout = QVBoxLayout(grp_resource)
         self.lbl_resource = QLabel('CPU / GPU：正在读取…')
         resource_layout.addWidget(self.lbl_resource)
-        self.cb_cpu_high_speed = QCheckBox('CPU 高速模式（预留部分算力）')
+        self.cb_cpu_high_speed = QCheckBox('CPU 高速模式')
         performance_settings = QSettings('PowerbankTestTool', 'Performance')
         self.cb_cpu_high_speed.setChecked(performance_settings.value('high_speed', False, type=bool))
         self.cb_cpu_high_speed.setToolTip(
-            '自动使用约85%的逻辑线程，加速数码管样本匹配和OCR。\n'
+            '自动使用约85%的逻辑线程；也可在下方手动选择全部线程。\n'
             '实际CPU占用取决于视频读取和识别任务，不保证固定百分比。下次开始分析时生效。')
         self.cb_cpu_high_speed.toggled.connect(self.on_high_speed_changed)
         resource_layout.addWidget(self.cb_cpu_high_speed)
         self.lbl_cpu_budget = QLabel(f'高速模式使用 {high_speed_threads()} / {os.cpu_count() or 1} 个逻辑线程')
+        self.lbl_cpu_budget.setWordWrap(True)
         resource_layout.addWidget(self.lbl_cpu_budget)
         cpu_row = QHBoxLayout()
         cpu_row.addWidget(QLabel('识别计算线程数:'))
@@ -410,6 +413,34 @@ class MainWindow(QMainWindow):
                 'cpu_threads', self.cb_cpu_threads.currentData() or ''))
         cpu_row.addWidget(self.cb_cpu_threads, 1)
         resource_layout.addLayout(cpu_row)
+        self.cb_cpu_threads.currentIndexChanged.connect(self.update_cpu_budget)
+        self.update_cpu_budget()
+
+        self.cb_gpu = QCheckBox('GPU 加速（自动分析 OCR）')
+        self.cb_gpu.setChecked(performance_settings.value('gpu', False, type=bool))
+        self.cb_gpu.setToolTip('加速自动分析中的时间、容量和普通 LCD 电量 OCR。\n'
+                              '数码管样本匹配、图像校正和视频回查仍使用 CPU。\n'
+                              '显卡不可用时自动退回 CPU；下次开始分析时生效。')
+        resource_layout.addWidget(self.cb_gpu)
+        self.cb_gpu_device = QComboBox()
+        devices = directml_devices()
+        default_device = preferred_device(devices)
+        for device in devices:
+            self.cb_gpu_device.addItem(device['name'], device['id'])
+        if not devices:
+            self.cb_gpu_device.addItem('未检测到可用显卡', 0)
+        saved_device = performance_settings.value('gpu_device',
+                            default_device['id'] if default_device else 0, type=int)
+        index = self.cb_gpu_device.findData(saved_device)
+        self.cb_gpu_device.setCurrentIndex(max(0, index))
+        resource_layout.addWidget(self.cb_gpu_device)
+        self.lbl_ocr_backend = QLabel('OCR：下次开始分析时确认 GPU / CPU 状态')
+        self.lbl_ocr_backend.setWordWrap(True)
+        resource_layout.addWidget(self.lbl_ocr_backend)
+        self.cb_gpu.toggled.connect(lambda checked: QSettings(
+            'PowerbankTestTool', 'Performance').setValue('gpu', checked))
+        self.cb_gpu_device.currentIndexChanged.connect(lambda: QSettings(
+            'PowerbankTestTool', 'Performance').setValue('gpu_device', self.cb_gpu_device.currentData()))
         self.update_segment_controls()
         left_layout.addWidget(grp_resource)
 
@@ -1275,7 +1306,9 @@ class MainWindow(QMainWindow):
                 if control is not None:
                     control.setEnabled(not running)
         self.cb_cpu_high_speed.setEnabled(not running)
-        self.cb_cpu_threads.setEnabled(not running and not self.cb_cpu_high_speed.isChecked())
+        self.cb_cpu_threads.setEnabled(not running)
+        self.cb_gpu.setEnabled(not running)
+        self.cb_gpu_device.setEnabled(not running)
         lcd = self.cb_digit_type.currentData() != SEGMENT_MODE
         self.lbl_lcd_ignore.setVisible(lcd)
         for unit, button in self.lcd_ignore_buttons.items():
@@ -1292,7 +1325,15 @@ class MainWindow(QMainWindow):
 
     def on_high_speed_changed(self, checked):
         QSettings('PowerbankTestTool', 'Performance').setValue('high_speed', checked)
-        self.cb_cpu_threads.setEnabled(not checked and not (self.worker and self.worker.isRunning()))
+        self.cb_cpu_threads.setEnabled(not (self.worker and self.worker.isRunning()))
+        self.update_cpu_budget()
+
+    def update_cpu_budget(self):
+        selected = self.cb_cpu_threads.currentData()
+        budget = selected or (high_speed_threads() if self.cb_cpu_high_speed.isChecked() else None)
+        self.lbl_cpu_budget.setText(
+            f'最多使用 {budget} / {os.cpu_count() or 1} 个逻辑线程（实际占用随任务变化）'
+            if budget else '普通模式：识别库自动分配线程')
 
     def edit_lcd_ignore_regions(self, unit):
         if self.cb_digit_type.currentData() == SEGMENT_MODE or (self.worker and self.worker.isRunning()):
@@ -1496,12 +1537,14 @@ class MainWindow(QMainWindow):
                 lcd_ignore_regions=dict(self.lcd_ignore_regions),
                 cpu_threads=self.cb_cpu_threads.currentData(),
                 high_speed=self.cb_cpu_high_speed.isChecked(),
+                gpu=self.cb_gpu.isChecked(), gpu_device=self.cb_gpu_device.currentData(),
                 visual_tracking={1: self.visual_1.isChecked(), 2: self.visual_2.isChecked()},
                 meter_single_line={1: self.meter_single_1.isChecked(), 2: self.meter_single_2.isChecked()},
                 timing_refine={1: self.timing_refine_1.isChecked(), 2: self.timing_refine_2.isChecked()},
                 visual_reference_records=visual_reference_records
             )
             self.worker.progress_signal.connect(self.on_worker_progress)
+            self.worker.backend_signal.connect(self.lbl_ocr_backend.setText)
             self.worker.point_detected_signal.connect(self.on_worker_point_detected)
             self.worker.review_pending_signal.connect(self.on_worker_review_pending)
             self.worker.point_revoked_signal.connect(self.on_worker_point_revoked)

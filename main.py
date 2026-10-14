@@ -1,4 +1,5 @@
 # 必须在最顶部导入 onnxruntime，避免 Windows 下 C++ 运行时 DLL 冲突
+from core.runtime_bootstrap import prepare_runtime
 import onnxruntime
 import sys
 import os

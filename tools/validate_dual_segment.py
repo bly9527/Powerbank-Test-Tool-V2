@@ -20,6 +20,8 @@ parser.add_argument('--library', required=True)
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--end', type=float, default=200.)
 parser.add_argument('--high-speed', action='store_true')
+parser.add_argument('--gpu', action='store_true', help='Use DirectML for OCR')
+parser.add_argument('--gpu-device', type=int, default=0, help='DXGI adapter index')
 parser.add_argument('--threads', type=int, default=2)
 parser.add_argument('--baseline-dir', type=Path)
 parser.add_argument('--compare', type=Path, help='Earlier results.json; require identical records and evidence')
@@ -27,6 +29,7 @@ args = parser.parse_args()
 out = args.output.resolve()
 out.mkdir(parents=True, exist_ok=False)
 os.environ['LOCALAPPDATA'] = str(out/'appdata')
+from core.runtime_bootstrap import prepare_runtime
 import onnxruntime  # Must precede Qt imports on Windows.
 if os.name == 'nt':
     import ctypes
@@ -52,7 +55,8 @@ worker = VideoAnalysisWorker(
     roi_soc_2=(1290, 253, 75, 48), roi_time_2=(162, 768, 55, 51), roi_cap_2=(218, 768, 49, 51),
     active_units=[1, 2], modes={1: 'discharge', 2: 'discharge'}, digit_type=SEGMENT_MODE,
     segment_paths={1: args.library, 2: args.library}, sample_interval_sec=1.,
-    cpu_threads=args.threads, high_speed=args.high_speed, timing_refine={1: True, 2: True}, end_sec=args.end)
+    cpu_threads=args.threads, high_speed=args.high_speed, gpu=args.gpu, gpu_device=args.gpu_device,
+    timing_refine={1: True, 2: True}, end_sec=args.end)
 records = {1: {}, 2: {}}
 errors = []
 
@@ -64,6 +68,9 @@ def detected(unit, record):
 
 worker.point_detected_signal.connect(detected)
 worker.error_signal.connect(errors.append)
+backend_messages = []
+if hasattr(worker, 'backend_signal'):
+    worker.backend_signal.connect(backend_messages.append)
 progress_bucket = [-1]
 
 
@@ -78,11 +85,14 @@ worker.progress_signal.connect(progress)
 started, cpu_started = time.perf_counter(), time.process_time()
 worker.run()
 result = dict(video=args.video, library=args.library, end_sec=args.end,
+              gpu_requested=args.gpu, backend_messages=backend_messages,
               high_speed=args.high_speed, threads=args.threads, records=records, errors=errors,
               elapsed_seconds=time.perf_counter()-started, cpu_seconds=time.process_time()-cpu_started,
               performance=getattr(worker, 'performance_stats', {}))
 (out/'results.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
 assert not errors, errors
+if args.gpu:
+    assert worker.ocr_engine.ocr.active, backend_messages
 for unit in (1, 2):
     for soc in (99, 98, 97):
         record = records[unit][soc]

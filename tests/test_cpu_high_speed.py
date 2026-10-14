@@ -92,12 +92,13 @@ class CPUHighSpeedTests(unittest.TestCase):
             root = Path(tmp)
             library(root)
             baseline = None
-            for scenario in ('serial', 'fast', 'stop', 'error'):
+            for scenario in ('serial', 'fast', 'manual', 'override', 'stop', 'error'):
                 roi = (0, 0, 110, 70)
                 worker = VideoAnalysisWorker('fake', roi_soc_1=roi, roi_time_1=roi, roi_cap_1=roi,
                     roi_soc_2=roi, roi_time_2=roi, roi_cap_2=roi, digit_type=SEGMENT_MODE,
                     modes={1: 'charge', 2: 'charge'}, segment_paths={1: str(root), 2: str(root)},
-                    high_speed=scenario != 'serial')
+                    high_speed=scenario not in ('serial', 'manual'),
+                    cpu_threads=8 if scenario == 'override' else (3 if scenario == 'manual' else None))
                 pools, results, errors = [], [], []
                 def make_pool(**kw):
                     pool = ThreadPoolExecutor(**kw)
@@ -115,16 +116,17 @@ class CPUHighSpeedTests(unittest.TestCase):
                 self.assertEqual(cv2.getNumThreads(), previous)
                 self.assertEqual(len(pools), int(scenario != 'serial'))
                 for pool in pools:
+                    self.assertEqual(pool._max_workers, 8 if scenario == 'override' else 3)
                     with self.assertRaises(RuntimeError): pool.submit(lambda: None)
                 if scenario == 'serial':
                     baseline = results
                     self.assertIn(25, baseline[0][0])
                     self.assertIn(25, baseline[0][1])
-                elif scenario == 'fast': self.assertEqual(results, baseline)
+                elif scenario in ('fast', 'manual', 'override'): self.assertEqual(results, baseline)
                 elif scenario == 'stop': self.assertEqual(results, [({}, {})])
                 self.assertEqual(bool(errors), scenario == 'error')
 
-    def test_ui_mode_persists_and_locks_manual_threads_during_high_speed(self):
+    def test_ui_mode_persists_and_allows_manual_threads_until_running(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             settings = lambda *_: QSettings(str(root / 'settings.ini'), QSettings.IniFormat)
@@ -134,18 +136,24 @@ class CPUHighSpeedTests(unittest.TestCase):
                 window = MainWindow()
                 window.cb_cpu_threads.setCurrentIndex(window.cb_cpu_threads.findData(1))
                 window.cb_cpu_high_speed.setChecked(True)
-                self.assertFalse(window.cb_cpu_threads.isEnabled())
+                self.assertTrue(window.cb_cpu_threads.isEnabled())
+                window.cb_gpu.setChecked(True)
+                selected_gpu = window.cb_gpu_device.currentData()
                 window.close()
                 reopened = MainWindow()
                 self.assertTrue(reopened.cb_cpu_high_speed.isChecked())
                 self.assertEqual(reopened.cb_cpu_threads.currentData(), 1)
-                self.assertFalse(reopened.cb_cpu_threads.isEnabled())
+                self.assertTrue(reopened.cb_gpu.isChecked())
+                self.assertEqual(reopened.cb_gpu_device.currentData(), selected_gpu)
+                self.assertTrue(reopened.cb_cpu_threads.isEnabled())
                 reopened.cb_cpu_high_speed.setChecked(False)
                 self.assertTrue(reopened.cb_cpu_threads.isEnabled())
                 reopened.worker = SimpleNamespace(isRunning=lambda: True)
                 reopened.update_segment_controls()
                 self.assertFalse(reopened.cb_cpu_high_speed.isEnabled())
                 self.assertFalse(reopened.cb_cpu_threads.isEnabled())
+                self.assertFalse(reopened.cb_gpu.isEnabled())
+                self.assertFalse(reopened.cb_gpu_device.isEnabled())
                 reopened.worker = None
                 reopened.update_segment_controls()
                 self.assertTrue(reopened.cb_cpu_high_speed.isEnabled())

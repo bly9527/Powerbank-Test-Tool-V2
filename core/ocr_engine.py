@@ -1,3 +1,5 @@
+from core.runtime_bootstrap import prepare_runtime
+import onnxruntime  # Before OpenCV/Qt DLLs on Windows.
 import re
 import cv2
 import numpy as np
@@ -5,10 +7,20 @@ from datetime import time
 from rapidocr_onnxruntime import RapidOCR
 
 class OCREngine:
-    def __init__(self, cpu_threads=None):
+    def __init__(self, cpu_threads=None, *, gpu=False, gpu_device=0, backend_callback=None):
         # 初始化 RapidOCR 引擎
         self.ocr = (RapidOCR(intra_op_num_threads=int(cpu_threads), inter_op_num_threads=1)
                     if cpu_threads else RapidOCR())
+        self.backend_status = 'OCR：CPU'
+        if gpu:
+            from core.gpu_backend import AcceleratedOCR
+            def changed(status):
+                self.backend_status = status
+                if backend_callback:
+                    backend_callback(status)
+            self.ocr = AcceleratedOCR(self.ocr, int(gpu_device), changed)
+        elif backend_callback:
+            backend_callback(self.backend_status)
 
     def preprocess_soc_crop(self, crop_img):
         """
