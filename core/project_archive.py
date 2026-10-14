@@ -141,6 +141,8 @@ class ProjectArchive:
     def _archive_record(self, record, source_video):
         result = {'time_str': record.get('time_str', ''),
                   'capacity': record.get('capacity'), 'video_sec': record.get('video_sec')}
+        result.update({key: record[key] for key in ('capture_method', 'capture_unit', 'manual_override', 'capacity_raw',
+                  'timing_method', 'timing_original_sec', 'timing_search_start_sec') if key in record})
         source = record.get('source_video')
         result['source_video'] = source if isinstance(source, str) and source else str(source_video or '')
         if record.get('locator_version') != 1:

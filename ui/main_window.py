@@ -37,6 +37,8 @@ from core.project_archive import (ProjectArchive, create_project, delete_project
     project_catalog, group_key)
 from core.resource_monitor import ResourceMonitor
 from core.performance import high_speed_threads
+from core.visual_tracking import suggested_range
+from ui.manual_capture_dialog import ManualCaptureDialog
 
 
 class MainWindow(QMainWindow):
@@ -506,7 +508,20 @@ class MainWindow(QMainWindow):
         layout_t1.addWidget(lbl_t1)
         self.table_1 = QTableWidget()
         self.setup_table_properties(self.table_1, unit_id=1)
-        layout_t1.addWidget(self.table_1)
+        self.meter_single_1 = QCheckBox('1# 时间、容量各为单行数字')
+        self.meter_single_1.setToolTip('各框仅包含一行仪表数据时勾选，帮助读取小数点和冒号。')
+        layout_t1.addWidget(self.meter_single_1)
+        self.visual_1 = QCheckBox('1# 连续画面对比辅助识别')
+        self.visual_1.setToolTip('用 5 帧建立临时参考，变化后至少 3 帧确认；数字仍须识别，不按顺序猜测。')
+        layout_t1.addWidget(self.visual_1)
+        self.timing_refine_1 = QCheckBox('1# 向前回查关键帧（最多120秒）')
+        self.timing_refine_1.setChecked(True)
+        self.timing_refine_1.setToolTip('数字确认后回查更早的相同电量画面，从回查帧读取时间、容量；不减固定秒数。')
+        layout_t1.addWidget(self.timing_refine_1)
+        self.manual_1 = QPushButton('1# 补采选中电量 / 重新选帧')
+        self.manual_1.clicked.connect(lambda: self.open_manual_capture(1))
+        layout_t1.addWidget(self.manual_1)
+        layout_t1.addWidget(self.table_1, 1)
 
         # 2# 表格容器
         self.container_table_2 = QWidget()
@@ -518,7 +533,20 @@ class MainWindow(QMainWindow):
         layout_t2.addWidget(lbl_t2)
         self.table_2 = QTableWidget()
         self.setup_table_properties(self.table_2, unit_id=2)
-        layout_t2.addWidget(self.table_2)
+        self.meter_single_2 = QCheckBox('2# 时间、容量各为单行数字')
+        self.meter_single_2.setToolTip('各框仅包含一行仪表数据时勾选，帮助读取小数点和冒号。')
+        layout_t2.addWidget(self.meter_single_2)
+        self.visual_2 = QCheckBox('2# 连续画面对比辅助识别')
+        self.visual_2.setToolTip('用 5 帧建立临时参考，变化后至少 3 帧确认；数字仍须识别，不按顺序猜测。')
+        layout_t2.addWidget(self.visual_2)
+        self.timing_refine_2 = QCheckBox('2# 向前回查关键帧（最多120秒）')
+        self.timing_refine_2.setChecked(True)
+        self.timing_refine_2.setToolTip('数字确认后回查更早的相同电量画面，从回查帧读取时间、容量；不减固定秒数。')
+        layout_t2.addWidget(self.timing_refine_2)
+        self.manual_2 = QPushButton('2# 补采选中电量 / 重新选帧')
+        self.manual_2.clicked.connect(lambda: self.open_manual_capture(2))
+        layout_t2.addWidget(self.manual_2)
+        layout_t2.addWidget(self.table_2, 1)
 
         # 保持旧属性引用
         self.table = self.table_1
@@ -542,6 +570,35 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(right_panel)
 
         self.refresh_target_tables()
+
+    def open_manual_capture(self, unit):
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(self, '正在分析', '请先停止分析，再补采，避免记录被后台结果覆盖。')
+            return
+        if not self.video_path:
+            QMessageBox.information(self, '请先选择视频', '请打开要补采的原视频并核对本机的三个选区。')
+            return
+        table = self.table_1 if unit == 1 else self.table_2
+        row = table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, '选择电量', '请先在该样机表格中点击要补采的电量行。')
+            return
+        soc = int(table.item(row, 0).text().replace('%', '').strip())
+        if not self.validate_selected_rois(unit == 1, unit == 2):
+            return
+        records = self.extracted_records_1 if unit == 1 else self.extracted_records_2
+        if soc in records and QMessageBox.question(self, '重新选帧', f'{unit}# 已有 {soc}% 记录，确认后将替换该条记录，是否继续？') != QMessageBox.Yes:
+            return
+        duration = self.total_frames / max(1., self.fps)
+        start, end = suggested_range(records, soc, self.unit_modes[unit].currentData(), self.video_path, duration)
+        rois = {name: self.canvas.rois[f'{name}_{unit}'] for name in ('soc', 'time', 'cap')}
+        rotations = {name: self.canvas.get_roi_rotation(f'{name}_{unit}') for name in rois}
+        dialog = ManualCaptureDialog(self.video_path, unit, soc, rois, rotations, start, end,
+                                     duration, cap_unit=('mAh' if 'mAh' in self.cb_cap_unit.currentText() else 'Ah'), parent=self)
+        dialog.single_line.setChecked(getattr(self, f'meter_single_{unit}').isChecked())
+        if dialog.exec_() == QDialog.Accepted and dialog.record:
+            self.on_worker_point_detected(unit, dialog.record)
+            self.lbl_status.setText(f'状态: {unit}# {soc}% 已人工补采；请保存到存档。')
 
     def on_roi_rb_toggled(self, checked, roi_type):
         if checked:
@@ -1212,6 +1269,11 @@ class MainWindow(QMainWindow):
 
     def update_segment_controls(self):
         running = bool(self.worker and self.worker.isRunning())
+        for unit in (1, 2):
+            for name in ('visual', 'meter_single', 'timing_refine', 'manual'):
+                control = getattr(self, f'{name}_{unit}', None)
+                if control is not None:
+                    control.setEnabled(not running)
         self.cb_cpu_high_speed.setEnabled(not running)
         self.cb_cpu_threads.setEnabled(not running and not self.cb_cpu_high_speed.isChecked())
         lcd = self.cb_digit_type.currentData() != SEGMENT_MODE
@@ -1398,6 +1460,8 @@ class MainWindow(QMainWindow):
             if digit_type == SEGMENT_MODE:
                 self.segment_matchers(has_1, has_2)
 
+            visual_reference_records = {1: list(self.extracted_records_1.values()),
+                                        2: list(self.extracted_records_2.values())}
             self.refresh_target_tables()
             self.extracted_records_1 = {}
             self.extracted_records_2 = {}
@@ -1431,7 +1495,11 @@ class MainWindow(QMainWindow):
                 segment_paths=dict(self.segment_paths),
                 lcd_ignore_regions=dict(self.lcd_ignore_regions),
                 cpu_threads=self.cb_cpu_threads.currentData(),
-                high_speed=self.cb_cpu_high_speed.isChecked()
+                high_speed=self.cb_cpu_high_speed.isChecked(),
+                visual_tracking={1: self.visual_1.isChecked(), 2: self.visual_2.isChecked()},
+                meter_single_line={1: self.meter_single_1.isChecked(), 2: self.meter_single_2.isChecked()},
+                timing_refine={1: self.timing_refine_1.isChecked(), 2: self.timing_refine_2.isChecked()},
+                visual_reference_records=visual_reference_records
             )
             self.worker.progress_signal.connect(self.on_worker_progress)
             self.worker.point_detected_signal.connect(self.on_worker_point_detected)
@@ -1544,12 +1612,17 @@ class MainWindow(QMainWindow):
             table.item(row, 3).setText(f"{record['video_sec']:.1f}s" if isinstance(record.get("video_sec"), (int, float)) else "--")
             item_status = table.item(row, 4)
             item_status.setToolTip('')
-            if record.get('time_obj') is None:
-                item_status.setText("⚠️ 时间待核对")
+            if record.get('time_obj') is None or record.get('capacity') is None:
+                item_status.setText("⚠️ 时间/容量待核对")
                 item_status.setForeground(QColor(180, 110, 0))
             else:
-                item_status.setText("✅ 已捕获" if record.get("locator_version") else "已记录 · 旧定位")
+                item_status.setText("人工补采" if record.get("capture_method") == "manual" else ("✅ 已捕获" if record.get("locator_version") else "已记录 · 旧定位"))
                 item_status.setForeground(QColor(0, 150, 0))
+            if record.get('timing_method') == 'visual_backtrack':
+                recovered = record['timing_original_sec'] - record['video_sec']
+                item_status.setToolTip(f"已向前回查 {recovered:.3f} 秒，时间和容量来自回查原始帧。")
+                if record.get('time_obj') is not None and record.get('capacity') is not None:
+                    item_status.setText(f'已回查 · 提前 {recovered:.1f}s')
             table.blockSignals(False)
 
     def on_worker_finished(self, all_data_1, all_data_2):
@@ -1637,7 +1710,8 @@ class MainWindow(QMainWindow):
                 cap_val = float(cap_text.replace('Ah', '').replace('mAh', '').strip()) if cap_text != '--' else None
             except ValueError:
                 cap_val = None
-            if time_obj is None and cap_val is None:
+            originals = self.extracted_records_1 if unit_id == 1 else self.extracted_records_2
+            if time_obj is None and cap_val is None and not originals.get(soc, {}).get("snapshot_path"):
                 continue
 
             video_sec = 0.0

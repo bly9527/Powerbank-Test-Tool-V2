@@ -210,11 +210,40 @@ class OCREngine:
         if not res:
             return None, "", 0.0
 
+        # A Power-Z column can include its header plus total/window rows.
+        # Keep the first numeric row, matching the top displayed test-time row.
+        # Never concatenate duplicate rows or take the first numeric fragment
+        # of a malformed single row.
+        lines = []
+        for item in sorted(res, key=lambda x: sum(pt[1] for pt in x[0]) / len(x[0])):
+            center = sum(pt[1] for pt in item[0]) / len(item[0])
+            height = max(pt[1] for pt in item[0]) - min(pt[1] for pt in item[0])
+            if lines and abs(center - lines[-1][0]) <= max(5., min(height, lines[-1][2]) * .55):
+                lines[-1][1].append(item)
+            else:
+                lines.append([center, [item], height])
+        numeric_lines = [items for _, items, _ in lines if any(re.search(r'\d', item[1]) for item in items)]
+        if len(lines) > 1 and numeric_lines:
+            header_units = [re.search(r'(mAh|Ah)', item[1], re.IGNORECASE).group(1)
+                            for _, items, _ in lines for item in items
+                            if not re.search(r'\d', item[1]) and re.search(r'(mAh|Ah)', item[1], re.IGNORECASE)]
+            res = list(numeric_lines[0])
+            if len(set(unit.lower() for unit in header_units)) == 1 and not any('ah' in item[1].lower() for item in res):
+                # Unit-only box stays on this row and cannot introduce a digit.
+                rightmost = max(res, key=lambda item: max(pt[0] for pt in item[0]))
+                box = [[pt[0] + 10000, pt[1]] for pt in rightmost[0]]
+                res.append([box, header_units[0], 1.])
         res.sort(key=lambda x: min(pt[0] for pt in x[0]))
         full_text = " ".join([item[1] for item in res])
         avg_score = sum([float(item[2]) for item in res]) / max(len(res), 1)
 
-        m = re.search(r'(\d+(?:\.\d+)?)', full_text)
+        # A fragmented reading such as "0 5 109" is not a measured zero.
+        # Require the complete field so a lost decimal or a neighbouring
+        # table column cannot silently become the first numeric fragment.
+        m = re.fullmatch(
+            r'\s*(?:容量\s*[:：]?\s*)?(\d+(?:\.\d+)?)\s*(mAh|Ah)?\s*',
+            full_text, re.IGNORECASE,
+        )
         if not m:
             return None, full_text, 0.0
 

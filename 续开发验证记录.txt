@@ -1,0 +1,44 @@
+续开发验证记录（2026-10-14）
+
+说明：本文是当天早期开发的历史记录。后续已完成 2# 样本匹配修复及 CPU 性能优化，
+最新验证和 Git 更新范围以“开发交接说明.txt”和“新功能使用与验证说明.txt”为准。
+
+仓库：C:\Users\30583\Documents\Codex\2026-10-14\task\Powerbank-Test-Tool-V2
+分支 main，HEAD a3dba4ffe5022c0da43dc3dc485af1b40fc7cf91。
+已执行 git pull --ff-only origin main，远端无更新。
+拉取前本地未提交内容备份：C:\Users\30583\Documents\Codex\2026-10-14\task\Powerbank-local-backup-20261014-080849
+既有 test_project_archive.py、test_capacity_parsing.py、pytest.ini 改动保留，不属于本轮新增。
+
+环境：项目 .venv，Python 3.12.10；pip install -r requirements.txt、pip check 完成。
+PyQt5 5.15.11，OpenCV 5.0.0.93，RapidOCR 1.4.4，ONNX Runtime 1.31.0，openpyxl 3.1.5。
+源码 main.py 已启动并观察到双机主窗口。
+
+本轮修改：
+1. 启动测试工具.bat 优先使用项目 .venv，并修复括号块内 errorlevel 检查；实际执行解释器选择部分，确认指向项目 .venv。
+2. core/ocr_engine.py 容量解析改为完整字段匹配。拒绝多段数字、残缺小数、时间及其他列的数字，防止只截取第一段成为容量。
+3. tests/test_capacity_integrity.py 覆盖真实 OCR 碎片、合法单位、零值及无效字段。
+
+验证：
+修改前完整回归 119 passed, 132 subtests passed。
+修改后相关容量/时间/worker/高速模式/存档导出测试 24 passed, 43 subtests passed。
+git diff --check 通过。
+20 条真实抽帧 OCR 文本回放中，16 条原先返回数值的碎片结果被拒绝。
+双机时间、容量写入后重开存档及导出测试通过，使用合成记录，不代表真实视频全流程通过。
+
+数据与剩余问题：
+F:\PB313\5V充电 20261012.mp4 存在，1440x900，约 30 fps，580249 帧。
+本机 PB313 样本库目录 template_1da5a5eb5f1942f0be194fe8d2008825；不是交接记录中的 template_5ceada37d2f0469fb3cdadc3f7f4009d，未证实内容等同。
+本机 J218 存档有 9 项且所引用视频均存在；PB313 存档有 0 项。
+抽样时刻为 0、1、2、60、300、600、1200、3600、10000、11500 秒，未全片运行。
+使用交接电量 ROI 和根据 600 秒画面选取的时间/容量 ROI，未将这些配置写入真实存档。
+早期窗口位置有变化，60 秒时间/容量框读到表头；不能把所有抽样失败都归因于 OCR 算法。
+二号电量在多个清晰样本上拒识，需要对照原机样本库及重新核对 ROI。
+真实时间有漏读和误读，容量 0.5038 曾完整漏读为单个 0；本轮完整字段校验无法区分这种结果与真实零值。
+仍需修复图像识别并完成真实双机 GUI 流程、普通/高速一致性、记录回看及存档导出。
+尚未重新打包，旧 EXE 不含新修改。未提交或推送本轮代码。
+
+证据目录：C:\Users\30583\Documents\ChatGPT\1\validation
+regression.txt / regression.xml：完整回归结果。
+source-window.png：源码启动窗口。
+real-crops.png / real-probe.json：抽样画面及修复前 OCR 结果。
+capacity-parser-replay.json：容量文本修复前后对比。

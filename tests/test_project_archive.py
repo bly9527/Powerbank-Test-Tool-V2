@@ -104,6 +104,47 @@ class ProjectArchiveTests(unittest.TestCase):
             self.assertIn('1#', ws['A2'].value)
             self.assertIn('2#', ws['O2'].value)
 
+    def test_synthetic_dual_unit_time_capacity_round_trip_export(self):
+        """Synthetic fixture values must remain in their unit's cells and archive rows."""
+        template = next(Path(__file__).resolve().parents[1].glob('PB519*.xlsx'))
+        with tempfile.TemporaryDirectory() as temporary, patch(
+                'core.project_archive.projects_home', return_value=Path(temporary) / 'projects'):
+            project = create_project('synthetic dual-unit export', template)
+            discharge_sheet = next(name for name in project.groups if '\u653e\u7535' in name)
+            groups = [g for g in project.groups[discharge_sheet] if g['title_row'] == 2]
+            group_by_unit = {1 if g['col_offset'] == 0 else 2: g for g in groups}
+            fixture = {
+                1: {'time_str': '00:12:34', 'time_obj': time(0, 12, 34), 'capacity': 1.2345},
+                2: {'time_str': '00:56:07', 'time_obj': time(0, 56, 7), 'capacity': 0.0678},
+            }
+            assignments = [
+                {'unit': unit, 'mode': 'discharge', 'group': group_by_unit[unit],
+                 'records': {99: dict(record, video_sec=unit * 10.0)}}
+                for unit, record in fixture.items()
+            ]
+            self.assertEqual(project.save_results(assignments, 'synthetic-fixture-video.mp4'),
+                             {1: 1, 2: 1})
+
+            reopened = ProjectArchive(project.root)
+            output = Path(temporary) / 'synthetic-export.xlsx'
+            self.assertEqual(reopened.export(output), 2)
+            result = openpyxl.load_workbook(output, data_only=False)
+            ws = result[discharge_sheet]
+            self.assertEqual(ws['B4'].value, time(0, 12, 34))
+            self.assertEqual(ws['P4'].value, time(0, 56, 7))
+            self.assertEqual(ws['B5'].value, 1.2345)
+            self.assertEqual(ws['P5'].value, 0.0678)
+            self.assertEqual(ws['B4'].number_format, 'h:mm:ss')
+            self.assertEqual(ws['P4'].number_format, 'h:mm:ss')
+            self.assertEqual(ws['B5'].number_format, '0.0000_ ')
+            self.assertEqual(ws['P5'].number_format, '0.0000_ ')
+            for unit, group in group_by_unit.items():
+                entry = reopened.metadata['entries'][group_key(group)]
+                self.assertEqual(entry['unit'], unit)
+                self.assertEqual(entry['records']['99']['time_str'], fixture[unit]['time_str'])
+                self.assertEqual(entry['records']['99']['capacity'], fixture[unit]['capacity'])
+            result.close()
+
     def test_delete_project_is_scoped_and_rejects_open_excel(self):
         template = next(Path(__file__).resolve().parents[1].glob('PB519*.xlsx'))
         with tempfile.TemporaryDirectory() as temporary, patch(

@@ -10,11 +10,13 @@ echo 正在检测运行环境并启动测试工具图形界面，请稍候...
 
 set PY_EXE=
 
-if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" (
+if exist "%~dp0.venv\Scripts\python.exe" (
+    set "PY_EXE=%~dp0.venv\Scripts\python.exe"
+) else if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" (
     set "PY_EXE=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
 ) else (
     where python >nul 2>nul
-    if %errorlevel% equ 0 (
+    if not errorlevel 1 (
         set "PY_EXE=python"
     ) else if exist "%LOCALAPPDATA%\Programs\Python\Python310\python.exe" (
         set "PY_EXE=%LOCALAPPDATA%\Programs\Python\Python310\python.exe"
@@ -31,7 +33,8 @@ if "%PY_EXE%"=="" (
 )
 
 echo 当前使用 Python 解释器: %PY_EXE%
-"%PY_EXE%" main.py
+echo 当前项目目录: %~dp0
+"%PY_EXE%" "%~dp0main.py"
 
 if %errorlevel% neq 0 (
     echo.

@@ -6,7 +6,7 @@ import traceback
 import os
 from pathlib import Path
 from uuid import uuid4
-from core.record_evidence import save_evidence
+from core.record_evidence import save_evidence, load_snapshot
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from core.performance import high_speed_threads
@@ -18,6 +18,9 @@ from core.segment_dataset import (SEGMENT_MODE, SegmentMatcher, read_frame_at,
                                  mask_ocr_regions, validate_ignore_regions)
 from core.roi_geometry import crop_roi
 from core.soc_tracker import SegmentSOCTracker
+from core.visual_tracking import VisualTracker
+from core.meter_reader import read_meter_fields
+from core.keyframe_timing import refine_keyframe, TimingCropCache
 
 
 class VideoAnalysisWorker(QThread):
@@ -48,16 +51,30 @@ class VideoAnalysisWorker(QThread):
                  segment_paths=None,
                  cpu_threads=None,
                  high_speed=False,
+                 visual_tracking=None,
+                 meter_single_line=None,
+                 timing_refine=None,
+                 visual_reference_records=None,
+                 start_sec=0., end_sec=None,
                  roi_soc=None, roi_time=None, roi_cap=None,
                  lcd_ignore_regions=None,
                  **kwargs):
         super().__init__()
         self.video_path = video_path
+        self.start_sec = max(0., float(start_sec))
+        self.end_sec = end_sec
         self.digit_type = digit_type
         self.segment_paths = segment_paths or {}
         self.lcd_ignore_regions = {unit: validate_ignore_regions((lcd_ignore_regions or {}).get(unit, ()))
                                    for unit in (1, 2)}
         self.segment_diagnostics = {}
+        self.visual_trackers = {u: VisualTracker(sample_interval_sec) for u in (1, 2)
+                                if (visual_tracking or {}).get(u, False)}
+        self.visual_observations = {}
+        self.meter_single_line = dict(meter_single_line or {})
+        self.timing_refine = dict(timing_refine or {})
+        self._timing_previous = {}
+        self.visual_reference_records = visual_reference_records or {}
         self._correction_checks = set()
 
         # 兼容单样机或旧参数调用
@@ -95,6 +112,10 @@ class VideoAnalysisWorker(QThread):
         self.cap_unit = cap_unit  # 'Ah' 或 'mAh'
         self.is_running = True
         self.target_socs = {unit: set(get_target_soc_list(self.modes[unit])) for unit in (1, 2)}
+        self._timing_crop_cache = TimingCropCache(
+            [(getattr(self, f'roi_soc_{unit}'), getattr(self, f'rot_soc_{unit}'))
+             for unit in self.active_units])
+        self.performance_stats = {}
 
         # OCR 引擎在 run() 线程内实例化，避免跨线程调用 ONNX 运行时
         self.ocr_engine = None
@@ -181,16 +202,46 @@ class VideoAnalysisWorker(QThread):
             if reason is not None:
                 matcher.last_reason = reason
 
+    def _visual_observe(self, unit, crop, value, frame, seconds):
+        evidence = (frame, seconds, getattr(self, '_decoded_frame_index', None))
+        if unit in self.visual_trackers:
+            if value is None:
+                value = self.visual_trackers[unit].match_manual(crop)
+            result = self.visual_trackers[unit].update(crop, value, frame, seconds, evidence[2])
+            if result is None:
+                return None
+            value, *evidence = result
+        self.visual_observations[unit] = evidence
+        return value
+
+    def _refine_timing(self, unit, value, frame, seconds, index):
+        previous = self._timing_previous.get(unit)
+        metadata = {}
+        if self.timing_refine.get(unit, False) and value in self.target_socs[unit]:
+            lower = max(self.start_sec, previous[2] if previous else 0.)
+            result = refine_keyframe(self.video_path, getattr(self, f'roi_soc_{unit}'),
+                getattr(self, f'rot_soc_{unit}'), value, frame, seconds, index,
+                lower_bound=lower, competing=[(previous[0], previous[1])] if previous else (),
+                cancelled=lambda: not self.is_running, crop_cache=self._timing_crop_cache)
+            if result:
+                frame, seconds, index = result['frame'], result['video_sec'], result['frame_index']
+                metadata = {k:v for k,v in result.items() if k.startswith('timing_')}
+        self._timing_previous[unit] = (value, frame.copy(), seconds)
+        return frame, seconds, index, metadata
+
     def _process_segment_soc(self, unit, frame, seconds, matcher, tracker, records, last_capacity):
-        value, _ = matcher.extract_soc(self.crop(frame, getattr(self, f'roi_soc_{unit}'),
-                                               getattr(self, f'rot_soc_{unit}')))
+        crop = self.crop(frame, getattr(self, f'roi_soc_{unit}'), getattr(self, f'rot_soc_{unit}'))
+        value, _ = matcher.extract_soc(crop)
+        value = self._visual_observe(unit, crop, value, frame, seconds)
+        evidence_frame, evidence_sec, evidence_index = self.visual_observations.get(
+            unit, (frame, seconds, getattr(self, '_decoded_frame_index', None)))
 
         def capture():
-            return (self.crop(frame, getattr(self, f'roi_time_{unit}'),
+            return (self.crop(evidence_frame, getattr(self, f'roi_time_{unit}'),
                               getattr(self, f'rot_time_{unit}')).copy(),
-                    self.crop(frame, getattr(self, f'roi_cap_{unit}'),
+                    self.crop(evidence_frame, getattr(self, f'roi_cap_{unit}'),
                               getattr(self, f'rot_cap_{unit}')).copy(),
-                    frame.copy(), getattr(self, "_decoded_frame_index", None))
+                    evidence_frame.copy(), evidence_index, evidence_sec)
 
         accepted = tracker.update(value, seconds, capture)
         diagnostics = self.segment_diagnostics[unit]
@@ -237,18 +288,21 @@ class VideoAnalysisWorker(QThread):
         if accepted.value in records:
             return value, records[accepted.value]
 
-        time_image, capacity_image, evidence_frame, evidence_index = accepted.payload
-        time_str, time_obj, _ = self.ocr_engine.extract_time(time_image)
-        if not time_str or time_obj is None:
-            time_str, time_obj = '--', None
-        capacity, _, _ = self.ocr_engine.extract_capacity(capacity_image, target_unit=self.cap_unit)
-        if capacity is None:
-            capacity = last_capacity
+        time_image, capacity_image, evidence_frame, evidence_index = accepted.payload[:4]
+        record_sec = accepted.payload[4] if len(accepted.payload) > 4 else accepted.first_sec
+        evidence_frame, record_sec, evidence_index, timing = self._refine_timing(
+            unit, accepted.value, evidence_frame, record_sec, evidence_index)
+        time_image = self.crop(evidence_frame, getattr(self, f'roi_time_{unit}'), getattr(self, f'rot_time_{unit}'))
+        capacity_image = self.crop(evidence_frame, getattr(self, f'roi_cap_{unit}'), getattr(self, f'rot_cap_{unit}'))
+        fields = read_meter_fields(time_image, capacity_image, self.ocr_engine,
+                                   self.cap_unit, self.meter_single_line.get(unit, False))
+        time_str, time_obj, capacity = fields['time_str'], fields['time_obj'], fields['capacity']
         record = {'soc': accepted.value, 'time_str': time_str, 'time_obj': time_obj,
-                  'capacity': capacity, 'video_sec': accepted.first_sec,
+                  'capacity': capacity, 'video_sec': record_sec,
                   'is_target': accepted.value in self.target_socs[unit]}
+        record.update(timing)
         if record["is_target"]:
-            record.update(save_evidence(evidence_frame, self.video_path, accepted.first_sec,
+            record.update(save_evidence(evidence_frame, self.video_path, record_sec,
                                         evidence_index, self.evidence_directory))
         records[accepted.value] = record
         self.point_detected_signal.emit(unit, record)
@@ -290,6 +344,15 @@ class VideoAnalysisWorker(QThread):
 
             segment_matchers = {}
             segment_trackers = {}
+            for unit, visual in self.visual_trackers.items():
+                for record in self.visual_reference_records.get(unit, []):
+                    if (record.get('capture_method') != 'manual' or record.get('capture_unit') != unit
+                            or os.path.normcase(os.path.abspath(record.get('source_video') or '')) != os.path.normcase(os.path.abspath(self.video_path))):
+                        continue
+                    snapshot = load_snapshot(record)
+                    if snapshot is not None:
+                        visual.add_manual_reference(self.crop(snapshot, getattr(self, f'roi_soc_{unit}'),
+                                                              getattr(self, f'rot_soc_{unit}')), record['soc'])
             if self.digit_type == SEGMENT_MODE:
                 for unit, active in ((1, has_unit_1), (2, has_unit_2)):
                     if active:
@@ -323,12 +386,13 @@ class VideoAnalysisWorker(QThread):
             last_valid_cap_2 = 0.0
             extracted_data_2 = {}
 
-            cur_sec = 0.0
+            cur_sec = self.start_sec
+            analysis_end = min(total_duration, float(self.end_sec)) if self.end_sec is not None else total_duration
             last_decoded_sec = -1.0
             lcd_candidates = {}
             lcd_last_seen = {1: -float("inf"), 2: -float("inf")}
 
-            while self.is_running and cur_sec <= total_duration:
+            while self.is_running and cur_sec <= analysis_end:
                 frame_idx = int(cur_sec * fps)
                 if frame_idx >= total_frames:
                     break
@@ -365,6 +429,7 @@ class VideoAnalysisWorker(QThread):
                         crop_soc_1 = self.crop(frame, self.roi_soc_1, self.rot_soc_1)
                         crop_soc_1 = mask_ocr_regions(crop_soc_1, self.lcd_ignore_regions[1])
                         soc_val_1, _ = self.ocr_engine.extract_soc(crop_soc_1, digit_type=self.digit_type)
+                        soc_val_1 = self._visual_observe(1, crop_soc_1, soc_val_1, frame, sample_sec)
 
                     if self.digit_type != SEGMENT_MODE and sample_sec - lcd_last_seen[1] > max(2., self.sample_interval * 2):
                         candidate_soc_1, candidate_count_1 = None, 0
@@ -375,7 +440,7 @@ class VideoAnalysisWorker(QThread):
                         else:
                             candidate_soc_1 = soc_val_1
                             candidate_count_1 = 1
-                            lcd_candidates[1] = (frame.copy(), sample_sec, self._decoded_frame_index)
+                            lcd_candidates[1] = self.visual_observations.get(1, (frame.copy(), sample_sec, self._decoded_frame_index))
 
                         if candidate_count_1 >= self.debounce_count and confirmed_soc_1 != candidate_soc_1:
                             confirmed_soc_1 = candidate_soc_1
@@ -384,22 +449,15 @@ class VideoAnalysisWorker(QThread):
                         if candidate_count_1 >= self.debounce_count and confirmed_soc_1 not in extracted_data_1:
                             # 识别 1# 时间 (带旋转回正)
                             point_frame, point_sec_1, point_index = lcd_candidates[1]
-                            crop_t_1 = self.crop(point_frame, self.roi_time_1, self.rot_time_1)
-                            t1_str, t1_obj, _ = self.ocr_engine.extract_time(crop_t_1)
-                            if not t1_str or not t1_obj:
-                                m, s = divmod(int(point_sec_1), 60)
-                                h, m = divmod(m, 60)
-                                t1_str = f"{h:02d}:{m:02d}:{s:02d}"
-                                t1_obj = time(h % 24, m, s)
+                            point_frame, point_sec_1, point_index, timing = self._refine_timing(
+                                1, confirmed_soc_1, point_frame, point_sec_1, point_index)
+                            fields = read_meter_fields(
+                                self.crop(point_frame, self.roi_time_1, self.rot_time_1),
+                                self.crop(point_frame, self.roi_cap_1, self.rot_cap_1),
+                                self.ocr_engine, self.cap_unit, self.meter_single_line.get(1, False))
+                            t1_str, t1_obj, c1_val = fields['time_str'], fields['time_obj'], fields['capacity']
                             last_valid_time_str_1 = t1_str
-
-                            # 识别 1# 容量 (带旋转回正)
-                            crop_c_1 = self.crop(point_frame, self.roi_cap_1, self.rot_cap_1)
-                            c1_val, _, _ = self.ocr_engine.extract_capacity(crop_c_1, target_unit=self.cap_unit)
-                            if c1_val is not None:
-                                last_valid_cap_1 = c1_val
-                            else:
-                                c1_val = last_valid_cap_1
+                            last_valid_cap_1 = c1_val
 
                             rec_1 = {
                                 'soc': confirmed_soc_1,
@@ -409,6 +467,7 @@ class VideoAnalysisWorker(QThread):
                                 'video_sec': point_sec_1,
                                 'is_target': (confirmed_soc_1 in self.target_socs[1])
                             }
+                            rec_1.update(timing)
                             if rec_1["is_target"]:
                                 rec_1.update(save_evidence(point_frame, self.video_path, point_sec_1,
                                                             point_index, self.evidence_directory))
@@ -431,6 +490,7 @@ class VideoAnalysisWorker(QThread):
                         crop_soc_2 = self.crop(frame, self.roi_soc_2, self.rot_soc_2)
                         crop_soc_2 = mask_ocr_regions(crop_soc_2, self.lcd_ignore_regions[2])
                         soc_val_2, _ = self.ocr_engine.extract_soc(crop_soc_2, digit_type=self.digit_type)
+                        soc_val_2 = self._visual_observe(2, crop_soc_2, soc_val_2, frame, sample_sec)
 
                     if self.digit_type != SEGMENT_MODE and sample_sec - lcd_last_seen[2] > max(2., self.sample_interval * 2):
                         candidate_soc_2, candidate_count_2 = None, 0
@@ -441,7 +501,7 @@ class VideoAnalysisWorker(QThread):
                         else:
                             candidate_soc_2 = soc_val_2
                             candidate_count_2 = 1
-                            lcd_candidates[2] = (frame.copy(), sample_sec, self._decoded_frame_index)
+                            lcd_candidates[2] = self.visual_observations.get(2, (frame.copy(), sample_sec, self._decoded_frame_index))
 
                         if candidate_count_2 >= self.debounce_count and confirmed_soc_2 != candidate_soc_2:
                             confirmed_soc_2 = candidate_soc_2
@@ -450,22 +510,15 @@ class VideoAnalysisWorker(QThread):
                         if candidate_count_2 >= self.debounce_count and confirmed_soc_2 not in extracted_data_2:
                             # 识别 2# 时间 (带旋转回正)
                             point_frame, point_sec_2, point_index = lcd_candidates[2]
-                            crop_t_2 = self.crop(point_frame, self.roi_time_2, self.rot_time_2)
-                            t2_str, t2_obj, _ = self.ocr_engine.extract_time(crop_t_2)
-                            if not t2_str or not t2_obj:
-                                m, s = divmod(int(point_sec_2), 60)
-                                h, m = divmod(m, 60)
-                                t2_str = f"{h:02d}:{m:02d}:{s:02d}"
-                                t2_obj = time(h % 24, m, s)
+                            point_frame, point_sec_2, point_index, timing = self._refine_timing(
+                                2, confirmed_soc_2, point_frame, point_sec_2, point_index)
+                            fields = read_meter_fields(
+                                self.crop(point_frame, self.roi_time_2, self.rot_time_2),
+                                self.crop(point_frame, self.roi_cap_2, self.rot_cap_2),
+                                self.ocr_engine, self.cap_unit, self.meter_single_line.get(2, False))
+                            t2_str, t2_obj, c2_val = fields['time_str'], fields['time_obj'], fields['capacity']
                             last_valid_time_str_2 = t2_str
-
-                            # 识别 2# 容量 (带旋转回正)
-                            crop_c_2 = self.crop(point_frame, self.roi_cap_2, self.rot_cap_2)
-                            c2_val, _, _ = self.ocr_engine.extract_capacity(crop_c_2, target_unit=self.cap_unit)
-                            if c2_val is not None:
-                                last_valid_cap_2 = c2_val
-                            else:
-                                c2_val = last_valid_cap_2
+                            last_valid_cap_2 = c2_val
 
                             rec_2 = {
                                 'soc': confirmed_soc_2,
@@ -475,6 +528,7 @@ class VideoAnalysisWorker(QThread):
                                 'video_sec': point_sec_2,
                                 'is_target': (confirmed_soc_2 in self.target_socs[2])
                             }
+                            rec_2.update(timing)
                             if rec_2["is_target"]:
                                 rec_2.update(save_evidence(point_frame, self.video_path, point_sec_2,
                                                             point_index, self.evidence_directory))
@@ -498,7 +552,9 @@ class VideoAnalysisWorker(QThread):
                 # A blinking digit can be dark at every whole-second sample.
                 # Probe the other phase while a display is missing or a new
                 # value is still awaiting confirmation.
-                if self.digit_type == SEGMENT_MODE and (
+                if any(t.pending for t in self.visual_trackers.values()):
+                    cur_sec += min(self.sample_interval / 2, 0.2)
+                elif self.digit_type == SEGMENT_MODE and (
                     (has_unit_1 and (soc_val_1 is None or segment_trackers[1].needs_probe))
                     or (has_unit_2 and (soc_val_2 is None or segment_trackers[2].needs_probe))
                 ):
@@ -513,6 +569,11 @@ class VideoAnalysisWorker(QThread):
             err_details = f"视频分析过程中发生异常: {str(e)}\n\n{traceback.format_exc()}"
             self.error_signal.emit(err_details)
         finally:
+            self.performance_stats['timing_cache'] = dict(self._timing_crop_cache.stats)
+            self._timing_crop_cache.clear()
+            self.performance_stats['matching_cache'] = {
+                unit: dict(getattr(matcher, 'cache_stats', {}))
+                for unit, matcher in locals().get('segment_matchers', {}).items()}
             if 'cap' in locals():
                 cap.release()
             if pool is not None:

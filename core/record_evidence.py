@@ -10,7 +10,9 @@ import numpy as np
 from core.segment_dataset import read_frame_at, read_image, write_image
 
 
-LOCATOR_FIELDS = ('locator_version', 'source_video', 'frame_index', 'snapshot_path')
+LOCATOR_FIELDS = ('locator_version', 'source_video', 'frame_index', 'snapshot_path',
+                  'capture_method', 'capture_unit', 'manual_override', 'capacity_raw',
+                  'timing_method', 'timing_original_sec', 'timing_search_start_sec')
 
 
 def save_evidence(frame, source, seconds, frame_index, directory):

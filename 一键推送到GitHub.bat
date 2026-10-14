@@ -1,13 +1,11 @@
 @echo off
 cd /d "%~dp0"
 echo ========================================================
-echo   Pushing code to https://github.com/bly9527/1.git ...
+echo   Pushing code to https://github.com/bly9527/Powerbank-Test-Tool-V2.git ...
 echo ========================================================
 echo.
 
-git remote remove origin 2>nul
-git remote add origin https://github.com/bly9527/1.git
-git branch -M main
+git remote get-url origin
 
 echo Starting git push...
 git push -u origin main

@@ -1,0 +1,18 @@
+2026-10-14 文件夹清理说明
+
+唯一指定项目：C:\Users\30583\Documents\Codex\2026-10-14\task\Powerbank-Test-Tool-V2
+启动入口：本目录的“启动测试工具.bat”，明确运行本目录 main.py，优先使用本目录 .venv。
+
+已从本目录移入回收站的旧文件：
+充电宝数显均匀度自动测试工具.exe（内部固定引用桌面旧项目，导致打开不同软件）
+create_shortcut.py、move_to_folder.py（桌面旧打包版本的快捷方式/移动脚本）
+test_conflict.py、test_conflict2.py、test_glob.py、test_onnx.py、test_pipeline.py（旧的独立探针脚本）
+test_glob.spec、test_onnx.spec（探针打包配置）
+PB_Test_Tool_v2_Console.spec、PB_Test_Tool_v2.spec、PowerbankTestTool_v2.spec（重复旧打包配置）
+
+保留：main.py、core、ui、tests、tools、requirements.txt、.venv、.git、交接/使用说明、Excel 模板及备份。
+保留一个主程序打包配置 PowerbankTestTool_v2_single.spec 及 hook_onnx.py。
+连续画面对比和手动补采的新代码保留在本项目内。
+一键推送脚本已去掉把 origin 改到 bly9527/1.git 的旧逻辑；本次更新提交到 bly9527/Powerbank-Test-Tool-V2 的 main 分支。
+
+本次清理范围仅限本文件夹内部，桌面、视频、样本库和用户测试存档不在本次清理范围内。

@@ -1,5 +1,6 @@
 """Independent, explicitly labelled image libraries for segmented displays."""
 import json
+from collections import OrderedDict, Counter
 import math
 import os
 import time
@@ -273,6 +274,14 @@ def read_frame_at(cap, seconds):
     timestamp = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
     if not (position > 0 and timestamp < seconds and seconds - timestamp <= 5):
         cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, seconds-1.0)*1000)
+    # Decode dependent frames, but avoid BGR conversion/copy for every skipped
+    # frame. grab() advances the same decoder; retrieve() returns the exact
+    # first frame whose timestamp satisfies the original comparison.
+    if callable(getattr(cap, 'grab', None)) and callable(getattr(cap, 'retrieve', None)):
+        while cap.grab():
+            if cap.get(cv2.CAP_PROP_POS_MSEC)/1000 >= seconds-1e-6:
+                return cap.retrieve()
+        return False, None
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -379,7 +388,7 @@ def mask_ocr_regions(image, regions=()):
     return result
 
 
-def feature(image, ignore_regions=()):
+def feature(image, ignore_regions=(), *, threshold=.50):
     """Align the tall digit band, excluding short icons and empty background."""
     if image is None or image.size == 0:
         return None
@@ -397,7 +406,7 @@ def feature(image, ignore_regions=()):
         hi = np.partition(values.ravel(), -8)[-8]
         if hi - lo < 25:
             return None
-    mask = np.uint8(gray > lo + .50 * (hi - lo)) * 255
+    mask = np.uint8(gray > lo + threshold * (hi - lo)) * 255
     if ignored is not None:
         mask[ignored] = 0
     if np.count_nonzero(mask) < 8 or np.count_nonzero(mask) / values.size >= .65:
@@ -508,10 +517,13 @@ class SegmentMatcher:
     STROKE_PENALTY = .30
     MAX_STROKE_MISMATCH = .45
 
-    def __init__(self, root, threshold=.78, margin=.015, *, executor=None, workers=1):
+    def __init__(self, root, threshold=.78, margin=.015, *, executor=None, workers=1, cache_size=32):
         # The analysis worker owns the executor; matching never starts nested pools.
         self.executor = executor
         self.workers = max(1, int(workers))
+        self.cache_size = max(0, int(cache_size))
+        self.cache_stats = Counter()
+        self._direct_cache, self._alignment_cache = OrderedDict(), OrderedDict()
         self.roots = [Path(p) for p in library_paths(root)]
         self.root = self.roots[0] if self.roots else None
         self.threshold, self.margin = threshold, margin
@@ -542,6 +554,7 @@ class SegmentMatcher:
                     self.template_regions.append(regions)
         self.template_ink = [float(template.sum()) for _, template in self.templates]
         self.template_grids = [stroke_grid(template) for _, template in self.templates]
+        self.template_floats = [template.astype(np.float32)/255. for _, template in self.templates]
         self.labels = {label for label, _ in self.templates if type(label) is int}
 
     def extract_soc(self, image):
@@ -549,6 +562,64 @@ class SegmentMatcher:
         if not self.labels or all(c is None for c in candidates.values()):
             self.last_reason = '数字画面不完整或模板没有有效标签'
             return None, 0.0
+        scores = self._cached_scores(self._direct_cache, candidates,
+                                     self._compute_direct, 'direct')
+        aligned = False
+        recovered_dim_strokes = False
+        # Camera views can shear the same display differently on the two units.
+        # Only retry a rejected reading; never resolve an ambiguous/invalid
+        # direct match by searching for a more convenient transformation.
+        if scores and not any(self._admissible(e) for e in scores.values()):
+            for label, evidence in self._score_aligned(candidates).items():
+                scores[label] = max(scores.get(label, (-1., 0., 1.)), evidence,
+                                    key=self._evidence_key)
+            aligned = True
+            if not any(self._admissible(e) for e in scores.values()):
+                # Dim segments on the angled second screen can disappear at
+                # the normal 50% brightness cut. Recover only measured pixels
+                # above 40%; do not dilate or draw in presumed digit strokes.
+                # Recognition thresholds and competing-label checks stay fixed.
+                dim_candidates = {r: feature(image, r, threshold=.40) for r in candidates}
+                for label, evidence in self._score_aligned(dim_candidates).items():
+                    scores[label] = max(scores.get(label, (-1., 0., 1.)), evidence,
+                                        key=self._evidence_key)
+                recovered_dim_strokes = True
+        ranked = sorted(scores.items(), key=lambda pair: self._evidence_key(pair[1]), reverse=True)
+        label, (structure, score, mismatch) = ranked[0]
+        runner_up = (ranked[1][1][0] if len(ranked) > 1 and self._admissible(ranked[1][1]) else -1)
+        if label == 'invalid':
+            self.last_reason = '匹配到不可辨认样本'
+        elif not self._admissible((structure, score, mismatch)):
+            self.last_reason = (f'笔画证据不足：相似度 {score:.3f}，'
+                                f'结构分 {structure:.3f}，局部差异 {mismatch:.3f}')
+        elif len(ranked) > 1 and structure - runner_up < (.005 if ranked[1][0] == 'invalid' else self.margin):
+            self.last_reason = f'候选难以区分：{label}% / {ranked[1][0]}，差值 {structure-runner_up:.3f}'
+        else:
+            self.last_reason = f'{"角度校正后" if aligned else ""}匹配 {label}%，相似度 {score:.3f}'
+            if recovered_dim_strokes:
+                self.last_reason += '（恢复暗笔画）'
+            return label, score
+        return None, max(0.0, score)
+
+    def _cached_scores(self, cache, candidates, compute, kind):
+        # Exact normalized bytes only: similar-looking frames never share a
+        # result. Bright/dim passes each have their own complete feature key.
+        key = (self.threshold, self.margin, self.STROKE_PENALTY, self.MAX_STROKE_MISMATCH,
+               tuple((r, None if c is None else c.tobytes())
+                     for r, c in sorted(candidates.items())))
+        if self.cache_size and key in cache:
+            self.cache_stats[kind+'_hits'] += 1
+            cache.move_to_end(key)
+            return cache[key].copy()
+        self.cache_stats[kind+'_misses'] += 1
+        scores = compute(candidates)
+        if self.cache_size:
+            cache[key] = scores.copy()
+            while len(cache) > self.cache_size:
+                cache.popitem(last=False)
+        return scores
+
+    def _compute_direct(self, candidates):
         # Small translations tolerated, but ambiguous digits are rejected.
         prepared = {}
         for regions, c in candidates.items():
@@ -573,20 +644,89 @@ class SegmentMatcher:
                     scores[label] = max(previous, score, key=self._evidence_key)
         else:
             scores = self._score_templates(prepared, 0, len(self.templates))
-        ranked = sorted(scores.items(), key=lambda pair: self._evidence_key(pair[1]), reverse=True)
-        label, (structure, score, mismatch) = ranked[0]
-        runner_up = (ranked[1][1][0] if len(ranked) > 1 and self._admissible(ranked[1][1]) else -1)
-        if label == 'invalid':
-            self.last_reason = '匹配到不可辨认样本'
-        elif not self._admissible((structure, score, mismatch)):
-            self.last_reason = (f'笔画证据不足：相似度 {score:.3f}，'
-                                f'结构分 {structure:.3f}，局部差异 {mismatch:.3f}')
-        elif len(ranked) > 1 and structure - runner_up < (.005 if ranked[1][0] == 'invalid' else self.margin):
-            self.last_reason = f'候选难以区分：{label}% / {ranked[1][0]}，差值 {structure-runner_up:.3f}'
-        else:
-            self.last_reason = f'匹配 {label}%，相似度 {score:.3f}'
-            return label, score
-        return None, max(0.0, score)
+        return scores
+
+    def _score_aligned(self, candidates):
+        return self._cached_scores(self._alignment_cache, candidates,
+                                   self._compute_aligned, 'alignment')
+
+    def _compute_aligned(self, candidates):
+        """Bounded affine registration, followed by the SAME stroke gates.
+
+        ECC estimates geometry only. Its optimization score is not recognition
+        confidence. Re-score the original unsmoothed ink after registration;
+        missing strokes, conflicting labels and invalid labels still compete.
+        No learned state is shared between units or retained from prior frames.
+        """
+        shortlist = []
+        normalized = {r: c.astype(np.float32)/255. for r, c in candidates.items()
+                      if c is not None}
+        padded_candidates = {r: cv2.copyMakeBorder(c, 3, 3, 3, 3, cv2.BORDER_CONSTANT)
+                             for r, c in candidates.items() if c is not None}
+        for index, (_, template) in enumerate(self.templates):
+            candidate = candidates.get(self.template_regions[index])
+            if candidate is None:
+                continue
+            padded = padded_candidates[self.template_regions[index]]
+            correlation = cv2.minMaxLoc(cv2.matchTemplate(
+                padded, template, cv2.TM_CCOEFF_NORMED))[1]
+            if correlation >= .4:
+                shortlist.append((correlation, index))
+        # Keep every plausible competing label, including invalid samples.
+        # A top-N cutoff could hide a conflicting annotation in a large library.
+        # Stable ordering also makes both CPU modes deterministic.
+        shortlist.sort(key=lambda item: (-item[0], item[1]))
+        if self.executor is not None and self.workers > 1 and len(shortlist) > 1:
+            size = max(1, (len(shortlist)+self.workers*2-1)//(self.workers*2))
+            futures = [self.executor.submit(self._align_templates, candidates, normalized,
+                       shortlist[i:i+size]) for i in range(0, len(shortlist), size)]
+            scores = {}
+            # Completion order must not affect ties or competing labels.
+            for future in futures:
+                for label, evidence in future.result().items():
+                    scores[label] = max(scores.get(label, (-1., 0., 1.)), evidence,
+                                        key=self._evidence_key)
+            return scores
+        return self._align_templates(candidates, normalized, shortlist)
+
+    def _align_templates(self, candidates, normalized, shortlist):
+        scores = {}
+        for _, index in shortlist:
+            label, template = self.templates[index]
+            regions = self.template_regions[index]
+            candidate = candidates[regions]
+            transform = np.eye(2, 3, dtype=np.float32)
+            try:
+                _, transform = cv2.findTransformECC(
+                    self.template_floats[index], normalized[regions],
+                    transform, cv2.MOTION_AFFINE,
+                    (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 35, .001), None, 5)
+            except cv2.error:
+                continue
+            if not self._safe_alignment(transform):
+                continue
+            warped = cv2.warpAffine(candidate, transform, (104, 72),
+                                   flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
+            correlation = float(cv2.matchTemplate(
+                warped, template, cv2.TM_CCOEFF_NORMED)[0, 0])
+            score = correlation * min(1., float(warped.sum()) / self.template_ink[index])
+            mismatch = float(np.max(np.abs(stroke_grid(warped) - self.template_grids[index])))
+            evidence = (score - self.STROKE_PENALTY*mismatch, score, mismatch)
+            scores[label] = max(scores.get(label, (-1., 0., 1.)), evidence,
+                                key=self._evidence_key)
+        return scores
+
+    @staticmethod
+    def _safe_alignment(transform):
+        if transform.shape != (2, 3) or not np.isfinite(transform).all():
+            return False
+        # No flips, large rotations, large scaling, or cropping a digit away.
+        linear = transform[:, :2]
+        if (abs(linear[0, 0]-1) > .15 or abs(linear[1, 1]-1) > .15
+                or abs(linear[0, 1]) > .18 or abs(linear[1, 0]) > .18):
+            return False
+        centre = np.array([52., 36., 1.])
+        return bool(np.max(np.abs(transform @ centre - centre[:2])) <= 5.)
 
     def _admissible(self, evidence):
         structure, correlation, mismatch = evidence
